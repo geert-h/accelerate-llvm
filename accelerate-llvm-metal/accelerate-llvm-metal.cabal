@@ -1,0 +1,82 @@
+cabal-version:      2.2
+name:               accelerate-llvm-metal
+version:            1.4.0.0
+-- synopsis:
+-- description:
+license:            BSD-3-Clause
+license-file:       LICENSE
+author:             Geert Haans
+maintainer:         geert.haans@gmail.com
+-- copyright:
+category:
+    Accelerate, Compilers/Interpreters, Concurrency, Data, Parallelism
+
+build-type:         Simple
+extra-doc-files:    CHANGELOG.md
+-- extra-source-files:
+
+common warnings
+    ghc-options: -Wall
+
+library
+    import:           warnings
+    exposed-modules:
+        Data.Array.Accelerate.LLVM.Metal
+        Data.Array.Accelerate.LLVM.Metal.Operation
+        Data.Array.Accelerate.LLVM.Metal.Internal
+
+    other-modules:
+        Data.Array.Accelerate.LLVM.Metal.Array.Data
+        Data.Array.Accelerate.LLVM.Metal.Array.Prim
+        Data.Array.Accelerate.LLVM.Metal.Execute
+        Data.Array.Accelerate.LLVM.Metal.Execute.Binding
+        Data.Array.Accelerate.LLVM.Metal.Execute.Environment
+        Data.Array.Accelerate.LLVM.Metal.Execute.Generate
+        Data.Array.Accelerate.LLVM.Metal.Execute.Marshal
+        Data.Array.Accelerate.LLVM.Metal.Execute.Par
+        Data.Array.Accelerate.LLVM.Metal.Context
+        Data.Array.Accelerate.LLVM.Metal.CodeGen
+        Data.Array.Accelerate.LLVM.Metal.Compile
+        Data.Array.Accelerate.LLVM.Metal.Kernel
+        Data.Array.Accelerate.LLVM.Metal.Link
+        Data.Array.Accelerate.LLVM.Metal.Link.Object
+        Data.Array.Accelerate.LLVM.Metal.State
+        Data.Array.Accelerate.LLVM.Metal.Target
+        Data.Array.Accelerate.LLVM.Metal.FFI
+
+    build-depends:
+        formatting ^>=7.2.0,
+        base >=4.18 && <4.19,
+        accelerate ==1.4.*,
+        accelerate-llvm ==1.4.*,
+        async >=2.2 && <2.3,
+        bytestring,
+        containers,
+        deepseq,
+        microlens,
+        microlens-mtl,
+        mtl,
+        primitive,
+        template-haskell,
+        filepath,
+        process,
+        temporary
+
+    c-sources:        cbits/metal_context.m
+    cc-options:       -fobjc-arc
+    frameworks:       Foundation Metal CoreGraphics
+
+    hs-source-dirs:   src
+    default-language: Haskell2010
+
+test-suite accelerate-llvm-metal-test
+    import:           warnings
+    default-language: Haskell2010
+    -- other-modules:
+    -- other-extensions:
+    type:             exitcode-stdio-1.0
+    hs-source-dirs:   test
+    main-is:          Main.hs
+    build-depends:
+        base >=4.18 && <4.19,
+        accelerate-llvm-metal
