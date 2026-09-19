@@ -37,9 +37,9 @@ import Data.Array.Accelerate.Representation.Shape (ShapeR (..), shapeType, rank)
 import Data.Array.Accelerate.Representation.Type (TypeR, TupR (..))
 import Data.Array.Accelerate.Type
 import Data.Array.Accelerate.Analysis.Match
-import qualified Data.Array.Accelerate.Trafo.Partitioning.ILP.Graph as Graph
-import Data.Array.Accelerate.Trafo.Partitioning.ILP.Solver
-import qualified Data.Array.Accelerate.Trafo.Partitioning.ILP.Solver as ILP
+import Data.Array.Accelerate.Trafo.Partitioning.ILP.ConstraintLanguage (Constraint(..))
+import Data.Array.Accelerate.Trafo.Partitioning.ILP.LinearConstraint (Bounds, Number(..), Constants(..), Var(..), equal, lower)
+import Data.Array.Accelerate.Trafo.Partitioning.ILP.Solver (Solution)
 import Lens.Micro
 import Lens.Micro.Mtl
 import qualified Data.Map as M
@@ -263,30 +263,30 @@ instance SetOpIndices MetalOp where
   getOpLoopDirections _ _ _ = []
 
 instance MakesILP MetalOp where
-  type BackendVar MetalOp = ()
   type BackendArg MetalOp = Int -- direction: used to separate clusters later, preventing accidental horizontal fusion of backpermutes
   defaultBA = 0
   data BackendClusterArg MetalOp a = BCAN
+  combineBackendClusterArg BCAN BCAN = BCAN
 
   mkGraph :: Node Comp
           -> MetalOp args
           -> LabelledArgs env args
           -> State (BackendGraphState MetalOp env) ()
-  mkGraph c@(Node i _) MetalBackpermute (_fun :>: L _ lIn :>: L _ lOut :>: ArgsNil) = do
+  mkGraph c MetalBackpermute (_fun :>: L _ lIn :>: L _ lOut :>: ArgsNil) = do
     let bsIn  = getLabelArrDeps lIn
     let bsOut = getLabelArrDeps lOut
     wsIn <- use $ allWriters bsIn
     fusionILP.constraints %= (
       <> inputConstraints c wsIn
-      <> ILP.var (InFoldSize c) .==. ILP.var (OutFoldSize c)
-      <> allEqual ([ILP.int i] <>  readDirs (S.map (,c) bsIn))
-      <> allEqual (               writeDirs (S.map (c,) bsOut)))
+      <> [SameFoldSize c]
+      <> [PinnedDirection c (map (,c) (S.toList bsIn)) []]
+      <> [SameDirection [] (map (c,) (S.toList bsOut))])
     fusionILP.bounds %= (<> defaultBounds bsIn c bsOut)
     -- Different order, so no in-place paths.
 
   mkGraph c MetalGenerate (_fun :>: L _ lOut :>: ArgsNil) = do
     let bsOut = getLabelArrDeps lOut
-    fusionILP.constraints %= (<> allEqual (writeDirs (S.map (c,) bsOut)))
+    fusionILP.constraints %= (<> [SameDirection [] (map (c,) (S.toList bsOut))])
     fusionILP.bounds %= (<> defaultBounds mempty c bsOut)
     -- No input, so no in-place paths.
 
@@ -296,23 +296,12 @@ instance MakesILP MetalOp where
     wsIn <- use $ allWriters $ getLabelArrDeps lIn
     fusionILP.constraints %= (
       <> inputConstraints c wsIn
-      <> ILP.var (InFoldSize c) .==. ILP.var (OutFoldSize c)
-      <> allEqual (readDirs (S.map (,c) bsIn) <> writeDirs (S.map (c,) bsOut)))
+      <> [SameFoldSize c]
+      <> [SameDirection (map (,c) (S.toList bsIn)) (map (c,) (S.toList bsOut))])
     fusionILP.bounds %= (<> defaultBounds bsIn c bsOut)
     fusionILP.inplacePaths %= case isIdentity fun of
       Just Refl -> (<> mkUnitInplacePaths (Number nComps * Number nComps) c lIn lOut)
       _         -> (<> mkUnitInplacePaths 1 c lIn lOut)
-
-  {- mkGraph MetalPermute (_ :>: L _ (_, lTargets) :>: L _ (_, lLocks) :>: L (ArgArray In (ArrayR shr _) _ _) (_, lIns) :>: ArgsNil) l =
-    Graph.Info
-      ( mempty & infusibleEdges .~ Set.map (-?> l) (lTargets <> lLocks)) -- add infusible edges from the producers of target and lock arrays to the permute
-      (    inputConstraints l lIns
-        <> ILP.c (InFoldSize l) .==. ILP.c (OutFoldSize l)
-        <> ILP.c (InDims l) .==. int (rank shr)
-        <> ILP.c (InDir  l) .==. int (-2)
-        <> ILP.c (OutDir l) .==. int (-3)) -- Permute cannot fuse with its consumer
-      ( lower (-2) (InDir l)
-      <> upper (InDir l) (-1) ) -- default lowerbound for the input, but not for the output (as we set it to -3). -}
 
   mkGraph c MetalPermute (_fun :>: L _ lTargets :>: L _ lLocks :>: L _ lIn :>: ArgsNil) = do
     let bsTargets = getLabelArrDeps lTargets
@@ -323,7 +312,7 @@ instance MakesILP MetalOp where
     wsIn      <- use $ allWriters bsIn
     fusionILP %= (wsTargets <> wsLocks <> wsIn) `allBefore` c
     fusionILP.constraints %= (
-      <> ILP.var (InFoldSize c) .==. ILP.var (OutFoldSize c))
+      <> [SameFoldSize c])
     fusionILP.bounds %= (<> foldMap (equal (-2) . (`ReadDir` c)) (bsTargets <> bsLocks <> bsIn)
                          <> foldMap (equal (-3) . WriteDir c)    (bsTargets <> bsLocks <> bsIn))
 
@@ -335,7 +324,7 @@ instance MakesILP MetalOp where
     fusionILP %= wsTargets `allBefore` c
     fusionILP.constraints %= (
       <> inputConstraints c wsIn
-      <> ILP.var (InFoldSize c) .==. ILP.var (OutFoldSize c))
+      <> [SameFoldSize c])
     fusionILP.bounds %= (<> foldMap (equal (-2) . (`ReadDir` c)) (bsTargets <> bsIn)
                          <> foldMap (equal (-3) . WriteDir c) bsTargets)
 
@@ -345,7 +334,7 @@ instance MakesILP MetalOp where
     wsIn <- use $ allWriters $ getLabelArrDeps lIn
     fusionILP.constraints %= (
       <> inputConstraints c wsIn
-      <> ILP.var (InFoldSize c) .==. ILP.var (OutFoldSize c))
+      <> [SameFoldSize c])
     fusionILP.bounds %= (<> foldMap (equal dir  . (`ReadDir` c)) bsIn
                          <> foldMap (equal (-3) . WriteDir c) bsOut)
     -- Output size is one larger, so no in-place paths.
@@ -356,7 +345,7 @@ instance MakesILP MetalOp where
     wsIn <- use $ allWriters bsIn
     fusionILP.constraints %= (
       <> inputConstraints c wsIn
-      <> ILP.var (InFoldSize c) .==. ILP.var (OutFoldSize c))
+      <> [SameFoldSize c])
     fusionILP.bounds %= (<> foldMap (equal dir . (`ReadDir` c)) bsIn
                          <> foldMap (equal dir . WriteDir c) bsOut)
     fusionILP.inplacePaths %= (<> mkUnitInplacePaths 1 c lIn lOut)
@@ -368,7 +357,7 @@ instance MakesILP MetalOp where
     wsIn <- use $ allWriters $ getLabelArrDeps lIn
     fusionILP.constraints %= (
       <> inputConstraints c wsIn
-      <> ILP.var (OutFoldSize c) .==. ILP.int (c^.nodeId))
+      <> [NewFoldSize c])
     fusionILP.bounds %= (<> foldMap (equal dir . (`ReadDir` c)) bsIn
                          <> foldMap (equal dir . WriteDir c) (bsOut1 <> bsOut2))
     fusionILP.inplacePaths %= (<> mkUnitInplacePaths 1 c lIn lOut1)
@@ -379,8 +368,8 @@ instance MakesILP MetalOp where
     wsIn <- use $ allWriters bsIn
     fusionILP.constraints %= (
       <> inputConstraints c wsIn
-      <> ILP.var (OutFoldSize c) .==. ILP.int (c^.nodeId)
-      <> allEqual (readDirs (S.map (,c) bsIn) <> writeDirs (S.map (c,) bsOut)))
+      <> [NewFoldSize c]
+      <> [SameDirection (map (,c) (S.toList bsIn)) (map (c,) (S.toList bsOut))])
     fusionILP.bounds %= (<> defaultBounds bsIn c bsOut)
     -- Not the same shape, so no in-place paths.
 
@@ -390,12 +379,12 @@ instance MakesILP MetalOp where
     wsIn <- use $ allWriters bsIn
     fusionILP.constraints %= (
       <> inputConstraints c wsIn
-      <> ILP.var (OutFoldSize c) .==. ILP.int (c^.nodeId)
-      <> allEqual (readDirs (S.map (,c) bsIn) <> writeDirs (S.map (c,) bsOut)))
+      <> [NewFoldSize c]
+      <> [SameDirection (map (,c) (S.toList bsIn)) (map (c,) (S.toList bsOut))])
     fusionILP.bounds %= (<> defaultBounds bsIn c bsOut)
     -- Not the same shape, so no in-place paths.
 
-  labelLabelledArg :: M.Map (Graph.Var MetalOp) Int -> Node Comp -> LabelledArg env a -> LabelledArgOp MetalOp env a
+  labelLabelledArg :: Solution -> Node Comp -> LabelledArg env a -> LabelledArgOp MetalOp env a
   labelLabelledArg vars c (L x@(ArgArray In  _ _ _) y) = LOp x y (vars M.! ReadDir  (getLabelArrDep y) c)
   labelLabelledArg vars c (L x@(ArgArray Out _ _ _) y) = LOp x y (vars M.! WriteDir c (getLabelArrDep y))
   labelLabelledArg _ _ (L x y) = LOp x y 0
@@ -403,16 +392,14 @@ instance MakesILP MetalOp where
   getClusterArg :: LabelledArgOp MetalOp env a -> BackendClusterArg MetalOp a
   getClusterArg (LOp _ _ _) = BCAN
   -- For each label: If the output is manifest, then its direction is negative (i.e. not in a backpermuted order)
-  finalize g = foldMap (\(w,b) -> timesN (manifest b) .>. ILP.var (WriteDir w b)) (g^.writeEdges)
+  finalize g = map NegativeDirIfManifest (S.toList (g^.writeEdges))
 
   encodeBackendClusterArg (BCAN) = intHost $(hashQ ("BCAN" :: String))
 
-inputConstraints :: Node Comp -> Nodes Comp -> Constraint MetalOp
-inputConstraints c = foldMap $ \wIn ->
-                timesN (fused (wIn, c)) .>=. ILP.var (InFoldSize c) .-. ILP.var (OutFoldSize wIn)
-    <> (-1) .*. timesN (fused (wIn, c)) .<=. ILP.var (InFoldSize c) .-. ILP.var (OutFoldSize wIn)
+inputConstraints :: Node Comp -> Nodes Comp -> [Constraint]
+inputConstraints c = map (`SameFoldSizeIfFused` c) . S.toList
 
-defaultBounds :: Nodes GVal -> Node Comp -> Nodes GVal -> Bounds MetalOp
+defaultBounds :: Nodes GVal -> Node Comp -> Nodes GVal -> Bounds
 defaultBounds bsIn c bsOut = foldMap (lower (-2) . (`ReadDir` c)) bsIn
                           <> foldMap (lower (-2) . WriteDir c) bsOut
 

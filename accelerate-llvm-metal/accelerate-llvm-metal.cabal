@@ -31,7 +31,6 @@ library
         Data.Array.Accelerate.LLVM.Metal.Execute
         Data.Array.Accelerate.LLVM.Metal.Execute.Binding
         Data.Array.Accelerate.LLVM.Metal.Execute.Environment
-        Data.Array.Accelerate.LLVM.Metal.Execute.Generate
         Data.Array.Accelerate.LLVM.Metal.Execute.Marshal
         Data.Array.Accelerate.LLVM.Metal.Execute.Par
         Data.Array.Accelerate.LLVM.Metal.Context

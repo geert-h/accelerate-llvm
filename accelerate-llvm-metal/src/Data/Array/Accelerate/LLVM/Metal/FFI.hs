@@ -16,6 +16,9 @@ module Data.Array.Accelerate.LLVM.Metal.FFI
   , bufferDestroy
   , bufferFinalizer
   , bufferRead
+  , bufferContents
+  , bufferGPUAddress
+  , runKernel
   ) where
 
 import Foreign.C.String   (CString)
@@ -23,7 +26,7 @@ import Foreign.C.Types    (CInt(..), CSize(..))
 import Foreign.ForeignPtr (FinalizerPtr)
 import Foreign.Ptr        (Ptr)
 
-import Data.Word (Word32)
+import Data.Word (Word32, Word64)
 
 data RawContext
 
@@ -84,6 +87,33 @@ foreign import ccall safe "acc_metal_generate_i32"
     -> Ptr RawPipeline
     -> Word32
     -> Ptr RawBuffer
+    -> CString
+    -> CSize
+    -> IO CInt
+
+foreign import ccall safe "acc_metal_buffer_contents"
+  bufferContents
+    :: Ptr RawBuffer
+    -> CString
+    -> CSize
+    -> IO (Ptr ())
+
+foreign import ccall safe "acc_metal_buffer_gpu_address"
+  bufferGPUAddress
+  :: Ptr RawBuffer
+  -> Ptr Word64
+  -> CString
+  -> CSize
+  -> IO CInt
+
+foreign import ccall safe "acc_metal_run_kernel"
+  runKernel
+    :: Ptr RawContext
+    -> Ptr RawPipeline
+    -> Ptr RawBuffer
+    -> Word32
+    -> Ptr (Ptr RawBuffer)
+    -> CSize
     -> CString
     -> CSize
     -> IO CInt

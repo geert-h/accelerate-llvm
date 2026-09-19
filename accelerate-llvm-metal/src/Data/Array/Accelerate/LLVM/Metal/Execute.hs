@@ -9,9 +9,14 @@
 module Data.Array.Accelerate.LLVM.Metal.Execute () where
 
 import Control.Concurrent.MVar (putMVar, readMVar)
-import Control.Monad (forM_)
+import Control.Monad (forM_, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.Word (Word32)
+
+import Foreign.C.String (peekCString)
+import Foreign.Marshal.Alloc (allocaBytes)
+import Foreign.Marshal.Array (withArrayLen)
+import Foreign.Ptr (Ptr)
 
 import Data.Array.Accelerate.AST.Idx (Idx)
 import Data.Array.Accelerate.AST.Execute (Execute(..))
@@ -22,15 +27,21 @@ import Data.Array.Accelerate.AST.Schedule.Uniform
   ( UniformScheduleFun(..), UniformSchedule(..), Effect(..) )
 import Data.Array.Accelerate.AST.Var (Var(..))
 
+import Data.Array.Accelerate.LLVM.Metal.Array.Data (MetalBuffer(..), withBuffer)
+import Data.Array.Accelerate.LLVM.Metal.Context (withContext)
+import Data.Array.Accelerate.LLVM.Metal.FFI (RawBuffer)
+import qualified Data.Array.Accelerate.LLVM.Metal.FFI as FFI
+import Data.Array.Accelerate.LLVM.Metal.Link.Object (KernelObject(..), withKernelObject)
 import Data.Array.Accelerate.LLVM.Metal.State (evalMetal, defaultTarget)
 import Data.Array.Accelerate.LLVM.Metal.Kernel (MetalKernel(..))
 import Data.Array.Accelerate.LLVM.Metal.Execute.Environment
 import Data.Array.Accelerate.LLVM.Metal.Execute.Binding (executeBinding)
-import Data.Array.Accelerate.LLVM.Metal.Execute.Marshal (baseToValues, MarshalledKernel(..), marshalKernel)
+import Data.Array.Accelerate.LLVM.Metal.Execute.Marshal (baseToValues, MarshalledKernel(..), marshalKernel, withKernelArguments)
 import Data.Array.Accelerate.LLVM.Metal.Execute.Par (Par, evalPar, liftPar, spawnPar)
-import Data.Array.Accelerate.LLVM.Metal.Execute.Generate (launchGenerateI32)
 import Data.Array.Accelerate.Error (internalError)
 import Formatting
+import Data.Int (Int32)
+import Foreign.Storable (sizeOf)
 
 instance Execute UniformScheduleFun MetalKernel where
   data Linked UniformScheduleFun MetalKernel t =
@@ -98,29 +109,29 @@ executeEffect env = \case
       _ ->
         unsupported "expected output reference"
 
-  Exec _ function arguments -> do
+  Exec metadata function arguments -> do
     marshalled <- liftIO $ marshalKernel env function arguments
     case marshalled of
-      MarshalledKernel kernel kernelEnv ->
-        launchScheduledKernel kernel kernelEnv
+      MarshalledKernel kernel kernelEnv -> do
+        dims <- mapM (readDimension kernelEnv) (kernelElements kernel)
+        let count = product dims
+            limit = min (toInteger (maxBound :: Int)) (toInteger (maxBound :: Word32))
 
-  _ ->
-    unsupported "assertion/trace execution is not implemented"
+        when (count > limit) $ unsupported "Generate element count exceeds launch limits"
 
-launchScheduledKernel :: MetalKernel env -> Gamma env -> Par ()
-launchScheduledKernel kernel env = do
-  dims <- mapM (readDimension env) (kernelElements kernel)
-  let count = product dims
-      limit = min (toInteger (maxBound :: Int)) (toInteger (maxBound :: Word32))
+        case prj' (kernelOutput kernel) kernelEnv of
+          ValueBuffer _ output -> when (count > toInteger (bufferBytes output `div` sizeOf (undefined :: Int32))) $
+            unsupported "Generate output buffer is too small"
+          _ -> unsupported "expected Generate output buffer"
 
-  if count > limit
-    then unsupported "Generate element count exceeds launch limits"
-    else
-      case prj' (kernelOutput kernel) env of
-        ValueBuffer _ output ->
-          liftIO $
-            launchGenerateI32 (kernelMain kernel) output (fromInteger count)
-        _ -> unsupported "expected Generate output buffer"
+        when (count > 0) $ liftIO $ withKernelArguments (kernelObjContext (kernelMain kernel))
+          metadata
+          env
+          function
+          arguments
+          (\packed resources -> launch (kernelMain kernel) packed resources (fromInteger count))
+
+  _ -> unsupported "assertion/trace execution is not implemented"
 
 readDimension :: Gamma env -> Idx env Int -> Par Integer
 readDimension env idx =
@@ -130,3 +141,15 @@ readDimension env idx =
 unsupported :: String -> Par a
 unsupported message =
   internalError string ("accelerate-llvm-metal: " ++ message)
+
+-- launches a kernel
+launch :: KernelObject -> MetalBuffer -> [Ptr RawBuffer] -> Int -> IO ()
+launch kernel args resrs count
+  | count < 0 = internalError string "Negative Metal thread count"
+  | toInteger count > toInteger (maxBound :: Word32) = internalError string "Metal thread count exceeds Word32"
+  | count == 0 = pure ()
+  | otherwise = withContext (kernelObjContext kernel) $ \ctx -> withKernelObject kernel $ \pipe ->
+      withBuffer args $ \argBfr -> withArrayLen resrs $ \resrCnt resrArr -> allocaBytes 1024 $ \err -> do
+        status <- FFI.runKernel ctx pipe argBfr (fromIntegral count) resrArr (fromIntegral resrCnt) err 1024
+        when (status /= 0) $ peekCString err >>= internalError string
+
