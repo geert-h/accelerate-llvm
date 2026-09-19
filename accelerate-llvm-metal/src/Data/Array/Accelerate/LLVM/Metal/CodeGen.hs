@@ -88,7 +88,7 @@ generateArgumentTypes (Push env argument) = do
     AccessGroundRscalar tp
       | Just Refl <- matchScalarType tp scalarTypeInt -> pure "i64" -- for now only accept 64 bit integer 
     AccessGroundRbuffer _ tp
-      | Just Refl <- matchScalarType tp scalarTypeInt32 -> pure "i32 addrspace(1)*" -- for now only accept 32 bit integer buffer values
+      | Just Refl <- matchScalarType tp scalarTypeInt32 -> pure "ptr addrspace(1)" -- for now only accept 32 bit integer buffer values
     _ -> stop "unsupported Generate argument type"
   pure (fields ++ [field])
 
@@ -105,20 +105,20 @@ renderGenerate name fields extentField outputField value = unlines
     , ""
     , "%Args = type { " ++ intercalate ", " fields ++ " }" -- add all the fields to the arg buffer
     , ""
-    , "define void @" ++ name ++ "(%Args addrspace(2)* %args, i32 %gid) {"
+    , "define void @" ++ name ++ "(ptr addrspace(2) %args, i32 %gid) {"
     , "entry:"
-    , "  %extent.slot = getelementptr %Args, %Args addrspace(2)* %args, i32 0, i32 " ++ show extentField
-    , "  %n = load i64, i64 addrspace(2)* %extent.slot, align 8"
+    , "  %extent.slot = getelementptr %Args, ptr addrspace(2) %args, i32 0, i32 " ++ show extentField
+    , "  %n = load i64, ptr addrspace(2) %extent.slot, align 8"
     , "  %index = zext i32 %gid to i64"
     , "  %inside = icmp slt i64 %index, %n"
     , "  br i1 %inside, label %write, label %done"
     , ""
     , "write:"
-    , "  %output.slot = getelementptr %Args, %Args addrspace(2)* %args, i32 0, i32 " ++ show outputField
-    , "  %output = load i32 addrspace(1)*, i32 addrspace(1)* addrspace(2)* %output.slot, align 8"
+    , "  %output.slot = getelementptr %Args, ptr addrspace(2) %args, i32 0, i32 " ++ show outputField
+    , "  %output = load ptr addrspace(1), ptr addrspace(2) %output.slot, align 8"
     , "  %value = call i32 @generate_element(i64 %index)"
-    , "  %destination = getelementptr i32, i32 addrspace(1)* %output, i64 %index"
-    , "  store i32 %value, i32 addrspace(1)* %destination, align 4"
+    , "  %destination = getelementptr i32, ptr addrspace(1) %output, i64 %index"
+    , "  store i32 %value, ptr addrspace(1) %destination, align 4"
     , "  br label %done"
     , ""
     , "done:"
@@ -133,7 +133,7 @@ renderGenerate name fields extentField outputField value = unlines
     , "!air.kernel = !{!0}"
     , "!air.version = !{!6}"
     , "!air.language_version = !{!7}"
-    , "!0 = !{void (%Args addrspace(2)*, i32)* @" ++ name ++ ", !1, !2}"
+    , "!0 = !{ptr @" ++ name ++ ", !1, !2}"
     , "!1 = !{}"
     , "!2 = !{!3, !4}"
     , "!3 = !{i32 0, !\"air.indirect_buffer\", !\"air.buffer_size\", i32 16, !\"air.location_index\", i32 0, i32 1, !\"air.read\", !\"air.address_space\", i32 2, !\"air.struct_type_info\", !5, !\"air.arg_type_size\", i32 16, !\"air.arg_type_align_size\", i32 8, !\"air.arg_type_name\", !\"Args\", !\"air.arg_name\", !\"args\"}"

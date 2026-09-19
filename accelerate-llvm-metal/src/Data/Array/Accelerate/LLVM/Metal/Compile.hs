@@ -18,7 +18,7 @@ withCompiledModule source action =
         airFile  = dir </> "kernel.air"
         libFile  = dir </> "kernel.metallib"
     writeFile llvmFile source
-    execXcrun [ "-sdk", "macosx", "metal", "-c", llvmFile, "-o", airFile]
+    execXcrun [ "-sdk", "macosx", "metal", "-c", llvmFile, "-o", airFile, "-Xclang", "-opaque-pointers"]
     execXcrun [ "-sdk", "macosx", "metallib", airFile, "-o", libFile]
     action libFile
 
