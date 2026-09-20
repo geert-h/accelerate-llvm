@@ -189,7 +189,9 @@ codeGenFunction linkage name returnTp bind body = do
     ( a
     , Module
       { moduleName             = name
-      , moduleDataLayout       = [] -- TODO: Something with targetDataLayout @arch; this will be important for PTX
+      , moduleDataLayout       = case targetDataLayout @arch of
+          Just l -> l
+          Nothing -> []
       , moduleTargetTriple     = case targetTriple @arch of
           Just s -> LP.parseTriple (SBS8.unpack s)
           Nothing -> error "TODO: module target triple"
