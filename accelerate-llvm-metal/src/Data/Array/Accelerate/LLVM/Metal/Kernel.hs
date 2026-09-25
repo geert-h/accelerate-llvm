@@ -16,7 +16,6 @@ import Data.Int (Int32)
 import Data.String (fromString)
 
 import Data.Array.Accelerate.Analysis.Hash.Operation (hashOperation)
-import Data.Array.Accelerate.LLVM.State (unliftIOLLVM)
 import Data.Array.Accelerate.AST.Idx (Idx)
 import Data.Array.Accelerate.AST.Kernel (IsKernel(..), KernelArgR(..), OpenKernelFun(..))
 import Data.Array.Accelerate.Backend (NFData'(..))
@@ -36,6 +35,8 @@ import Data.Array.Accelerate.Array.Buffer (Buffer)
 import Foreign.Ptr (Ptr)
 import Data.Word (Word64)
 import Foreign.Storable (alignment, sizeOf)
+import Control.Monad.IO.Class (liftIO)
+import Data.Array.Accelerate.LLVM.Metal.Target (metalContext)
 
 data MetalKernel env = MetalKernel
   { kernelUID      :: !UID
@@ -95,8 +96,8 @@ instance IsKernel MetalKernel where
 
       generated <- codegen ("generate_" ++ show uid) parameterTypes cluster args
 
-      executable <- unliftIOLLVM $ \run -> withCompiledModule (metalCodeSource generated) $ \path ->
-        run $ Link.link path (metalCodeName generated)
+      executable <- liftIO $ withCompiledModule (metalCodeSource generated) $ \path ->
+        Link.loadKernel (metalContext defaultTarget) path (metalCodeName generated)
 
       pure MetalKernel
         { kernelUID      = uid

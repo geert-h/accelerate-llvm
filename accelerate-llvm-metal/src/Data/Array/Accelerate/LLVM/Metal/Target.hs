@@ -11,6 +11,7 @@ import Data.Array.Accelerate.LLVM.Target (Target(..))
 import Data.ByteString.Short (ShortByteString)
 import qualified Data.Array.Accelerate.LLVM.Internal.LLVMPretty.AST as LLVM
 import Data.Array.Accelerate.Error (internalError)
+import Data.Array.Accelerate.LLVM.CodeGen.Intrinsic (Intrinsic)
 
 newtype Metal = Metal
   { metalContext :: Context
@@ -31,3 +32,4 @@ metalDataLayout = case LLVM.parseDataLayout metalDataLayoutString of
  Just l -> l
  Nothing -> internalError "error while parsing metal data layout"
   
+instance Intrinsic Metal

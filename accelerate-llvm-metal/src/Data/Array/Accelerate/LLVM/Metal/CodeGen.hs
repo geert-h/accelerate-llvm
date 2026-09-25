@@ -13,7 +13,7 @@ import Data.Array.Accelerate.Analysis.Match (matchScalarType)
 import Data.Array.Accelerate.AST.Environment (Env (..))
 import Data.Array.Accelerate.AST.Idx
     ( Idx, matchIdx, matchIdx, idxToInt )
-import Data.Array.Accelerate.AST.LeftHandSide (LeftHandSide(..))
+import Data.Array.Accelerate.AST.LeftHandSide (LeftHandSide(..), Exists (..))
 import Data.Array.Accelerate.AST.Partitioned
 import Data.Array.Accelerate.Representation.Array (ArrayR(..))
 import Data.Array.Accelerate.Representation.Shape (ShapeR(..), DIM1)
@@ -28,6 +28,9 @@ import Formatting (string)
 
 import Data.List (intercalate)
 import qualified Data.ByteString.Short.Char8 as SBS
+import Data.Array.Accelerate.LLVM.CodeGen.Cluster (OpCodeGen)
+import Data.Array.Accelerate.LLVM.CodeGen.Default (defaultCodeGenPermuteUnique, defaultCodeGenFold, defaultCodeGenFold1, defaultCodeGenScan1, defaultCodeGenScan', defaultCodeGenScan, defaultCodeGenPermute, defaultCodeGenBackpermute, defaultCodeGenMap, defaultCodeGenGenerate)
+import Data.Array.Accelerate.LLVM.CodeGen.IR (Operands(..))
 
 data MetalCode env = MetalCode
   { metalCodeSource   :: !String
@@ -38,6 +41,83 @@ data MetalCode env = MetalCode
 
 codegen :: String -> Env AccessGroundR env -> Clustered MetalOp args -> Args env args -> LLVM Metal (MetalCode env)
 codegen name parameterTypes cluster args = codegenIndependent name parameterTypes (toFlatClustered cluster args)
+
+-- codegen :: String
+--         -> Env AccessGroundR env
+--         -> Clustered MetalOp args
+--         -> Args env args
+--         -> LLVM Metal
+--            ( Int -- The size of the kernel data, shared by all threads working on this kernel.
+--            , Module (KernelType env))
+-- codegen name env cluster args
+--  | flat@(FlatCluster shr idxLHS sizes dirs localR localLHS flatOps) <- toFlatClustered cluster args
+--  , parallelDepth <- flatClusterIndependentLoopDepth flat
+--  , Exists parallelShr <- shapeRFromRank parallelDepth =
+--   codeGenFunction linkage name type' (LLVM.Lam argTp "arg" . LLVM.Lam primType "locks_array" . LLVM.Lam primType "thread.index" . LLVM.Lam primType "thread.count") $ do
+--     extractEnv
+--
+--     -- Before the parallel work of a kernel is started, we first run the function once.
+--     -- This first call will initialize kernel memory (SEE: Kernel Memory)
+--     -- and decide whether the runtime may try to let multiple threads work on this kernel.
+--     initBlock <- newBlock "init"
+--     finishBlock <- newBlock "finish" -- Finish function from the work assisting paper
+--     workBlock <- newBlock "work"
+--     _ <- switch (OP_Word32 threadIndex) workBlock [(0xFFFFFFFF, initBlock), (0xFFFFFFFE, finishBlock)]
+--     let hasPermute = hasNPermute flat
+--
+--     -- Parallelise over all independent dimensions
+--     let (envs, loops) = initEnv gamma shr idxLHS sizes dirs localR localLHS
+--
+--     -- If we parallelize over all dimensions, choose a large tile size.
+--     -- The work per iteration is probably very small.
+--     -- If we do not parallelize over all dimensions, choose a tile size of 1.
+--     -- The work per iteration is probably large enough.
+--     let tileSize = if parallelDepth == rank shr then chunkSize parallelShr else chunkSizeOne parallelShr
+--     let parSizes = parallelIterSize parallelShr loops
+--
+--     setBlock initBlock
+--     do
+--       tileCount <- chunkCount parallelShr parSizes (A.lift (shapeType parallelShr) tileSize)
+--       tileCount' <- shapeSize parallelShr tileCount
+--       -- We are not using kernel memory, so no need to initialize it.
+--
+--       -- Assert that there are at most 2^47 tiles
+--       A.when (A.gt singleType tileCount' $ A.liftInt (1 `shiftL` 47)) $
+--         trapWithMessage "Accelerate: Parallel loops must have at most 2^47 tiles"
+--
+--       OP_Bool isSmall <- A.lt singleType tileCount' $ A.liftInt 2
+--       value <- instr' $ LLVM.Select isSmall (scalar (scalarType @Word8) 0) (scalar scalarType 1)
+--       retval_ value
+--
+--     setBlock finishBlock
+--     -- Nothing has to be done in the finish function for this kernel.
+--     retval_ $ scalar (scalarType @Word8) 0
+--
+--     setBlock workBlock
+--     let ann =
+--           if parallelDepth /= rank shr then []
+--           else {- if hasPermute then -} [Loop.LoopInterleave]
+--           -- else [Loop.LoopVectorize]
+--     workassistChunked ann parallelShr workassistIndex workPerThread 1024 threadIndex threadCount tileSize parSizes $ \idx -> do
+--       let envs' = envs{
+--           envsLoopDepth = parallelDepth,
+--           envsIdx =
+--             foldr (uncurry Env.partialUpdate) (envsIdx envs)
+--             $ zip (shapeOperandsToList parallelShr idx) (map (\(i, _, _) -> i) loops),
+--           -- Independent operations should not depend on envsIsFirst.
+--           envsIsFirst = OP_Bool $ boolean False,
+--           envsDescending = False
+--         }
+--       genSequential envs' (drop parallelDepth loops) $ opCodeGens opCodeGen flatOps
+--
+--     pure 0
+--   where
+--     (argTp, extractEnv, workassistIndex, workPerThread, threadIndex {- or flag -}, threadCount, kernelMem', gamma) = bindHeaderEnv env
+--
+--     isDescending :: LoopDirection Int -> Bool
+--     isDescending LoopDescending = True
+--     isDescending _ = False
+
 
 -- Currently this function only accepts one very restrictive generate case
 codegenIndependent :: String -> Env AccessGroundR env -> FlatCluster MetalOp env -> LLVM Metal (MetalCode env)
@@ -66,7 +146,7 @@ codegenIndependent name parameterTypes flat =
       , Just Refl <- matchIdx extent outputExtent                    -- checks whether the iteration length and output length reference the same var
       -> do
         fields <- generateArgumentTypes parameterTypes
-        
+
         -- TODO: some correctness checking here maybe
         value <- constantGenerator function
 
@@ -80,6 +160,26 @@ codegenIndependent name parameterTypes flat =
           , metalCodeOutput = output
           }
     _ -> stop "unsupported cluster: expected one independent, one-dimensional Int32 Generate with no local buffers, or index bindings, and matching iteration/output extents"
+
+-- opCodeGen :: FlatOp MetalOp env idxEnv -> (LoopDepth, OpCodeGen Metal MetalOp env idxEnv)
+-- opCodeGen flatOp@(FlatOp op args idxArgs) = case op of
+--   MetalGenerate -> defaultCodeGenGenerate args idxArgs
+--   MetalMap -> defaultCodeGenMap args idxArgs
+--   MetalBackpermute -> defaultCodeGenBackpermute args idxArgs
+--   -- TODO: Similar to Native, we should use one global array of locks, instead of an array per permute
+--   MetalPermute
+--     | combineFun :>: output :>: locks :>: source :>: _ <- args
+--     , i1 :>: i2 :>: _ :>: i3 :>: _ <- idxArgs ->
+--       defaultCodeGenPermute
+--         (\envs j _ -> atomically envs locks $ OP_Int j)
+--         (combineFun :>: output :>: source :>: ArgsNil)
+--         (i1 :>: i2 :>: i3 :>: ArgsNil)
+--   MetalPermute' -> defaultCodeGenPermuteUnique args idxArgs
+--   MetalFold -> defaultCodeGenFold flatOp args idxArgs
+--   MetalFold1 -> defaultCodeGenFold1 flatOp args idxArgs
+--   MetalScan1 dir -> defaultCodeGenScan1 dir flatOp args idxArgs
+--   MetalScan' dir -> defaultCodeGenScan' dir flatOp args idxArgs
+--   MetalScan dir -> defaultCodeGenScan dir flatOp args idxArgs
 
 generateArgumentTypes :: Env AccessGroundR env -> LLVM Metal [String]
 generateArgumentTypes Empty = pure []
@@ -100,7 +200,7 @@ constantGenerator _ = stop "only an Int32 constant generator is implemented"
 
 -- This function spits out very minimal .ll code to work with the generate operation
 renderGenerate :: String -> [String] -> Int -> Int -> Int32 -> String
-renderGenerate name fields extentField outputField value = metalDataLayout `seq` unlines
+renderGenerate name fields extentField outputField value = unlines
     [ "target triple = " ++ show (SBS.unpack metalTargetTriple)
     , ""
     , "%Args = type { " ++ intercalate ", " fields ++ " }" -- add all the fields to the arg buffer

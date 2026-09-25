@@ -21,6 +21,8 @@ import Data.Array.Accelerate.LLVM.Metal.Link.Object
 import Data.Array.Accelerate.LLVM.Metal.Target (Metal, metalContext)
 import Data.Array.Accelerate.Error (internalError)
 import Formatting (string)
+import Data.Array.Accelerate.LLVM.Metal.Compile (ObjectR(..))
+import qualified Data.ByteString.Short.Char8 as SBS
 
 loadKernel :: Context -> FilePath -> String -> IO KernelObject
 loadKernel context path name = mask_ $
@@ -47,7 +49,7 @@ withLoadedKernel
 withLoadedKernel context path name =
   bracket (loadKernel context path name) releaseKernelObject
 
-link :: FilePath -> String -> LLVM Metal KernelObject
-link path name = do
+link :: ObjectR f -> LLVM Metal KernelObject
+link object = do
   context <- asks metalContext
-  liftIO $ loadKernel context path name
+  liftIO $ loadKernel context (objPath object) (SBS.unpack (objSym object))
