@@ -24,6 +24,7 @@ library
         Data.Array.Accelerate.LLVM.Metal
         Data.Array.Accelerate.LLVM.Metal.Operation
         Data.Array.Accelerate.LLVM.Metal.Internal
+        Data.Array.Accelerate.LLVM.Metal.Foreign
 
     other-modules:
         Data.Array.Accelerate.LLVM.Metal.Array.Data

@@ -1,269 +1,367 @@
 {-# LANGUAGE GADTs #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TypeOperators #-}
 
 module Data.Array.Accelerate.LLVM.Metal.CodeGen
   ( MetalCode(..)
   , codegen
   ) where
 
-import Data.Int (Int32)
 import Data.Type.Equality ((:~:)(Refl))
 
-import Data.Array.Accelerate.Array.Buffer (Buffer)
-import Data.Array.Accelerate.Analysis.Match (matchScalarType)
-import Data.Array.Accelerate.AST.Environment (Env (..))
-import Data.Array.Accelerate.AST.Idx
-    ( Idx, matchIdx, matchIdx, idxToInt )
-import Data.Array.Accelerate.AST.LeftHandSide (LeftHandSide(..), Exists (..))
+import qualified Data.Array.Accelerate.AST.Environment as Env
+import Data.Array.Accelerate.LLVM.Metal.Foreign
+import Data.Array.Accelerate.AST.Idx (Idx)
+import Data.Array.Accelerate.AST.LeftHandSide (Exists (..), flattenTupR)
 import Data.Array.Accelerate.AST.Partitioned
-import Data.Array.Accelerate.Representation.Array (ArrayR(..))
-import Data.Array.Accelerate.Representation.Shape (ShapeR(..), DIM1)
-import Data.Array.Accelerate.Representation.Type (TupR(..))
-import Data.Array.Accelerate.Type (scalarTypeInt32, scalarTypeInt)
+import Data.Array.Accelerate.Representation.Type (TupR(..), TupleIdx (..))
 
-import Data.Array.Accelerate.LLVM.State (LLVM)
 import Data.Array.Accelerate.LLVM.Metal.Operation (MetalOp(..))
-import Data.Array.Accelerate.LLVM.Metal.Target (Metal, metalDataLayout, metalTargetTriple)
 import Data.Array.Accelerate.Error (internalError)
-import Formatting (string)
 
-import Data.List (intercalate)
 import qualified Data.ByteString.Short.Char8 as SBS
-import Data.Array.Accelerate.LLVM.CodeGen.Cluster (OpCodeGen)
-import Data.Array.Accelerate.LLVM.CodeGen.Default (defaultCodeGenPermuteUnique, defaultCodeGenFold, defaultCodeGenFold1, defaultCodeGenScan1, defaultCodeGenScan', defaultCodeGenScan, defaultCodeGenPermute, defaultCodeGenBackpermute, defaultCodeGenMap, defaultCodeGenGenerate)
+import Data.Array.Accelerate.LLVM.CodeGen.Cluster (OpCodeGen, genSequential, opCodeGens)
+import Data.Array.Accelerate.LLVM.CodeGen.Default (defaultCodeGenPermuteUnique, defaultCodeGenFold, defaultCodeGenFold1, defaultCodeGenScan1, defaultCodeGenScan', defaultCodeGenScan, defaultCodeGenBackpermute, defaultCodeGenMap, defaultCodeGenGenerate)
 import Data.Array.Accelerate.LLVM.CodeGen.IR (Operands(..))
 
+import qualified LLVM.AST.Type.Function as LLVM
+import Data.Array.Accelerate.LLVM.CodeGen.Environment
+import Data.Array.Accelerate.LLVM.CodeGen.Monad
+import LLVM.AST.Type.Representation
+import LLVM.AST.Type.Module
+import Data.Array.Accelerate.LLVM.CodeGen.Exp
+import qualified Data.Array.Accelerate.LLVM.CodeGen.Arithmetic as A
+import Data.Array.Accelerate.LLVM.CodeGen.Constant
+import Data.Array.Accelerate.LLVM.CodeGen.Base
+import Data.Array.Accelerate.LLVM.Metal.CodeGen.Base
+import LLVM.AST.Type.Operand
+import LLVM.AST.Type.Metadata (MetadataNodeID, Metadata (..), MetadataNode (..))
+import LLVM.AST.Type.Constant (Constant(ScalarConstant))
+import LLVM.AST.Type.Downcast
+import Data.Array.Accelerate.LLVM.CodeGen.Sugar
+import Data.String
+import LLVM.AST.Type.Instruction
+import LLVM.AST.Type.Instruction.Volatile
+import Data.Array.Accelerate.Representation.Shape (shapeRFromRank)
+
 data MetalCode env = MetalCode
-  { metalCodeSource   :: !String
-  , metalCodeName     :: !String
-  , metalCodeElements :: ![Idx env Int]
-  , metalCodeOutput   :: !(Idx env (Buffer Int32))
+  { metalCodeElements :: ![Idx env Int]
+  , metalCodeWork     :: Module (KernelType env)
   }
 
-codegen :: String -> Env AccessGroundR env -> Clustered MetalOp args -> Args env args -> LLVM Metal (MetalCode env)
-codegen name parameterTypes cluster args = codegenIndependent name parameterTypes (toFlatClustered cluster args)
-
--- codegen :: String
---         -> Env AccessGroundR env
---         -> Clustered MetalOp args
---         -> Args env args
---         -> LLVM Metal
---            ( Int -- The size of the kernel data, shared by all threads working on this kernel.
---            , Module (KernelType env))
--- codegen name env cluster args
---  | flat@(FlatCluster shr idxLHS sizes dirs localR localLHS flatOps) <- toFlatClustered cluster args
---  , parallelDepth <- flatClusterIndependentLoopDepth flat
---  , Exists parallelShr <- shapeRFromRank parallelDepth =
---   codeGenFunction linkage name type' (LLVM.Lam argTp "arg" . LLVM.Lam primType "locks_array" . LLVM.Lam primType "thread.index" . LLVM.Lam primType "thread.count") $ do
---     extractEnv
---
---     -- Before the parallel work of a kernel is started, we first run the function once.
---     -- This first call will initialize kernel memory (SEE: Kernel Memory)
---     -- and decide whether the runtime may try to let multiple threads work on this kernel.
---     initBlock <- newBlock "init"
---     finishBlock <- newBlock "finish" -- Finish function from the work assisting paper
---     workBlock <- newBlock "work"
---     _ <- switch (OP_Word32 threadIndex) workBlock [(0xFFFFFFFF, initBlock), (0xFFFFFFFE, finishBlock)]
---     let hasPermute = hasNPermute flat
---
---     -- Parallelise over all independent dimensions
---     let (envs, loops) = initEnv gamma shr idxLHS sizes dirs localR localLHS
---
---     -- If we parallelize over all dimensions, choose a large tile size.
---     -- The work per iteration is probably very small.
---     -- If we do not parallelize over all dimensions, choose a tile size of 1.
---     -- The work per iteration is probably large enough.
---     let tileSize = if parallelDepth == rank shr then chunkSize parallelShr else chunkSizeOne parallelShr
---     let parSizes = parallelIterSize parallelShr loops
---
---     setBlock initBlock
---     do
---       tileCount <- chunkCount parallelShr parSizes (A.lift (shapeType parallelShr) tileSize)
---       tileCount' <- shapeSize parallelShr tileCount
---       -- We are not using kernel memory, so no need to initialize it.
---
---       -- Assert that there are at most 2^47 tiles
---       A.when (A.gt singleType tileCount' $ A.liftInt (1 `shiftL` 47)) $
---         trapWithMessage "Accelerate: Parallel loops must have at most 2^47 tiles"
---
---       OP_Bool isSmall <- A.lt singleType tileCount' $ A.liftInt 2
---       value <- instr' $ LLVM.Select isSmall (scalar (scalarType @Word8) 0) (scalar scalarType 1)
---       retval_ value
---
---     setBlock finishBlock
---     -- Nothing has to be done in the finish function for this kernel.
---     retval_ $ scalar (scalarType @Word8) 0
---
---     setBlock workBlock
---     let ann =
---           if parallelDepth /= rank shr then []
---           else {- if hasPermute then -} [Loop.LoopInterleave]
---           -- else [Loop.LoopVectorize]
---     workassistChunked ann parallelShr workassistIndex workPerThread 1024 threadIndex threadCount tileSize parSizes $ \idx -> do
---       let envs' = envs{
---           envsLoopDepth = parallelDepth,
---           envsIdx =
---             foldr (uncurry Env.partialUpdate) (envsIdx envs)
---             $ zip (shapeOperandsToList parallelShr idx) (map (\(i, _, _) -> i) loops),
---           -- Independent operations should not depend on envsIsFirst.
---           envsIsFirst = OP_Bool $ boolean False,
---           envsDescending = False
---         }
---       genSequential envs' (drop parallelDepth loops) $ opCodeGens opCodeGen flatOps
---
---     pure 0
---   where
---     (argTp, extractEnv, workassistIndex, workPerThread, threadIndex {- or flag -}, threadCount, kernelMem', gamma) = bindHeaderEnv env
---
---     isDescending :: LoopDirection Int -> Bool
---     isDescending LoopDescending = True
---     isDescending _ = False
-
-
--- Currently this function only accepts one very restrictive generate case
-codegenIndependent :: String -> Env AccessGroundR env -> FlatCluster MetalOp env -> LLVM Metal (MetalCode env)
-codegenIndependent name parameterTypes flat =
-  case flat of
-    FlatCluster
-      (ShapeRsnoc ShapeRz)                                           -- Checks whether the shape is one-dimensional
-      _indexLHS                                                      -- Ignore the loop for now
-      (TupRpair TupRunit (TupRsingle (Var _ extent)))                -- defines the length represented as ((), length). extent identifies the kernel param that will contain the length
-      (TupRpair TupRunit (TupRsingle LoopAny))                       -- Says that the order of execution doesn't matter (which is the case for generate)
-      TupRunit                                                       -- The cluster has no local buffer types
-      (LeftHandSideWildcard TupRunit)                                -- no local variables are added to the param env
-      (FlatOpsOp                                                     -- This is the generate operation
-        (FlatOp MetalGenerate
-          (ArgFun function                                          -- Generate has a function and an output array
-            :>: ArgArray Out                                         -- One output array
-              (ArrayR (ShapeRsnoc ShapeRz) (TupRsingle elementType)) -- The output is one-dimensional, just like the input and each element is a single scalar
-              (TupRpair TupRunit
-                (TupRsingle (Var _ outputExtent)))                   -- param index containing the output length
-              buffers                                                -- identifies the output's underlying storage
-            :>: ArgsNil)
-          (IdxArgNone :>: IdxArgIdx 1 _indices :>: ArgsNil))         -- the function argument has not array-index annotation
-        FlatOpsNil)
-      | Just Refl <- matchScalarType elementType scalarTypeInt32     -- Checks that the element is type Int32
-      , TupRsingle (Var _ output) <- buffers                         -- extracts the single output-buffer var
-      , Just Refl <- matchIdx extent outputExtent                    -- checks whether the iteration length and output length reference the same var
-      -> do
-        fields <- generateArgumentTypes parameterTypes
-
-        -- TODO: some correctness checking here maybe
-        value <- constantGenerator function
-
-        let extentField = length fields - 1 - idxToInt extent
-            outputField = length fields - 1 - idxToInt output
-
-        pure MetalCode
-          { metalCodeSource = renderGenerate name fields extentField outputField value
-          , metalCodeName = name
-          , metalCodeElements = [extent]
-          , metalCodeOutput = output
-          }
-    _ -> stop "unsupported cluster: expected one independent, one-dimensional Int32 Generate with no local buffers, or index bindings, and matching iteration/output extents"
-
--- opCodeGen :: FlatOp MetalOp env idxEnv -> (LoopDepth, OpCodeGen Metal MetalOp env idxEnv)
--- opCodeGen flatOp@(FlatOp op args idxArgs) = case op of
---   MetalGenerate -> defaultCodeGenGenerate args idxArgs
---   MetalMap -> defaultCodeGenMap args idxArgs
---   MetalBackpermute -> defaultCodeGenBackpermute args idxArgs
---   -- TODO: Similar to Native, we should use one global array of locks, instead of an array per permute
---   MetalPermute
---     | combineFun :>: output :>: locks :>: source :>: _ <- args
---     , i1 :>: i2 :>: _ :>: i3 :>: _ <- idxArgs ->
---       defaultCodeGenPermute
---         (\envs j _ -> atomically envs locks $ OP_Int j)
---         (combineFun :>: output :>: source :>: ArgsNil)
---         (i1 :>: i2 :>: i3 :>: ArgsNil)
---   MetalPermute' -> defaultCodeGenPermuteUnique args idxArgs
---   MetalFold -> defaultCodeGenFold flatOp args idxArgs
---   MetalFold1 -> defaultCodeGenFold1 flatOp args idxArgs
---   MetalScan1 dir -> defaultCodeGenScan1 dir flatOp args idxArgs
---   MetalScan' dir -> defaultCodeGenScan' dir flatOp args idxArgs
---   MetalScan dir -> defaultCodeGenScan dir flatOp args idxArgs
-
-generateArgumentTypes :: Env AccessGroundR env -> LLVM Metal [String]
-generateArgumentTypes Empty = pure []
-generateArgumentTypes (Push env argument) = do
-  fields <- generateArgumentTypes env -- recursively call argument generation
-  field <- case argument of
-    AccessGroundRscalar tp
-      | Just Refl <- matchScalarType tp scalarTypeInt -> pure "i64" -- for now only accept 64 bit integer 
-    AccessGroundRbuffer _ tp
-      | Just Refl <- matchScalarType tp scalarTypeInt32 -> pure "ptr addrspace(1)" -- for now only accept 32 bit integer buffer values
-    _ -> stop "unsupported Generate argument type"
-  pure (fields ++ [field])
-
--- Currently only accepts a list of integers
-constantGenerator :: Fun env (DIM1 -> Int32) -> LLVM Metal Int32
-constantGenerator (Lam _ (Body (Const _ value))) = pure value
-constantGenerator _ = stop "only an Int32 constant generator is implemented"
-
--- This function spits out very minimal .ll code to work with the generate operation
-renderGenerate :: String -> [String] -> Int -> Int -> Int32 -> String
-renderGenerate name fields extentField outputField value = unlines
-    [ "target triple = " ++ show (SBS.unpack metalTargetTriple)
-    , ""
-    , "%Args = type { " ++ intercalate ", " fields ++ " }" -- add all the fields to the arg buffer
-    , ""
-    , "define void @" ++ name ++ "(ptr addrspace(2) %args, i32 %gid) {"
-    , "entry:"
-    , "  %extent.slot = getelementptr %Args, ptr addrspace(2) %args, i32 0, i32 " ++ show extentField
-    , "  %n = load i64, ptr addrspace(2) %extent.slot, align 8"
-    , "  %index = zext i32 %gid to i64"
-    , "  %inside = icmp slt i64 %index, %n"
-    , "  br i1 %inside, label %write, label %done"
-    , ""
-    , "write:"
-    , "  %output.slot = getelementptr %Args, ptr addrspace(2) %args, i32 0, i32 " ++ show outputField
-    , "  %output = load ptr addrspace(1), ptr addrspace(2) %output.slot, align 8"
-    , "  %value = call i32 @generate_element(i64 %index)"
-    , "  %destination = getelementptr i32, ptr addrspace(1) %output, i64 %index"
-    , "  store i32 %value, ptr addrspace(1) %destination, align 4"
-    , "  br label %done"
-    , ""
-    , "done:"
-    , "  ret void"
-    , "}"
-    , ""
-    , "define internal i32 @generate_element(i64 %index) {"
-    , "entry:"
-    , "  ret i32 " ++ show value
-    , "}"
-    , ""
-    , "!air.kernel = !{!0}"
-    , "!air.version = !{!6}"
-    , "!air.language_version = !{!7}"
-    , "!0 = !{ptr @" ++ name ++ ", !1, !2}"
-    , "!1 = !{}"
-    , "!2 = !{!3, !4}"
-    , "!3 = !{i32 0, !\"air.indirect_buffer\", !\"air.buffer_size\", i32 16, !\"air.location_index\", i32 0, i32 1, !\"air.read\", !\"air.address_space\", i32 2, !\"air.struct_type_info\", !5, !\"air.arg_type_size\", i32 16, !\"air.arg_type_align_size\", i32 8, !\"air.arg_type_name\", !\"Args\", !\"air.arg_name\", !\"args\"}"
-    , "!4 = !{i32 1, !\"air.thread_position_in_grid\", !\"air.arg_type_name\", !\"uint\"}"
-    , "!5 = !{" ++ intercalate ", " (map member [0, 1]) ++ "}"
-    , "!6 = !{i32 2, i32 8, i32 0}"
-    , "!7 = !{!\"Metal\", i32 4, i32 0, i32 0}"
-    , "!8 = !{i32 " ++ show outputField
-        ++ ", !\"air.buffer\", !\"air.location_index\", i32 "
-        ++ show outputField
-        ++ ", i32 1, !\"air.read_write\", !\"air.address_space\", i32 1, !\"air.arg_type_size\", i32 4, !\"air.arg_type_align_size\", i32 4, !\"air.arg_type_name\", !\"int\", !\"air.arg_name\", !\"output\"}"
-    , "!9 = !{i32 " ++ show extentField
-        ++ ", !\"air.indirect_constant\", !\"air.location_index\", i32 "
-        ++ show extentField
-        ++ ", i32 1, !\"air.arg_type_name\", !\"long\", !\"air.arg_name\", !\"extent\"}"
-    ]
+codegen :: forall env args.
+           String
+        -> Env AccessGroundR env
+        -> Clustered MetalOp args
+        -> Args env args
+        -> LLVM Metal (MetalCode env)
+codegen name env cluster args
+  | Refl <- marshalFunResultUnit env =
+    codegenIndependent name env flat independentLoopDepth
   where
-    -- builds metadata describing a field in the argument buffer
-    -- For example, it generates:
-    -- ; Field 0: output-buffer address
-    -- i32 0, i32 8, i32 0, !"int", !"output" !"air.indirect_argument", !9
-    --
-    -- ; Field 1: extent for the output buffer
-    -- i32 8, i32 8, i32 0, !"long", !"extent" !"air.indirect_argument", !8
-    member i = -- i is either 0 or 1
-      "i32 " ++ show (8 * i) ++ ", i32 8, i32 0, "
-        ++ if i == outputField
-             then "!\"int\", !\"output\", !\"air.indirect_argument\", !8"
-             else "!\"long\", !\"extent\", !\"air.indirect_argument\", !9"
+    flat = toFlatClustered cluster args
+    independentLoopDepth = flatClusterIndependentLoopDepth flat
 
-stop :: String -> LLVM Metal a
-stop msg = internalError string $ "accelerate-llvm-metal: " ++ msg
+codegenIndependent
+  :: forall env.
+     LLVM.Result (MarshalFun env) ~ ()
+  => String
+  -> Env AccessGroundR env
+  -> FlatCluster MetalOp env
+  -> Int
+  -> LLVM Metal (MetalCode env)
+codegenIndependent name env flatCluster parallelDepth
+  | FlatCluster shr idxLHS sizes dirs localR localLHS flatOps <- flatCluster
+  , Exists parallelShr <- shapeRFromRank parallelDepth
+  , (gamma, makeKernel') <- makeKernel name env = do
+    kernelWork <- makeKernel' "" $ do
+      let (envs, loops) = initEnv gamma shr idxLHS sizes dirs localR localLHS
+          parSizes = parallelIterSize parallelShr loops
+          threadId = OP_Word32 (LocalReference (PrimType primType) "thread_id")
+      parSize <- shapeSize parallelShr parSizes
+      linearIdx <- A.fromIntegral TypeWord32 numType threadId
 
+      A.when (A.lt singleType linearIdx parSize) $ do
+        idx <- indexOfInt parallelShr parSizes linearIdx
+        let envs' = envs
+             { envsLoopDepth = parallelDepth
+             , envsIdx =
+                 foldr (uncurry Env.partialUpdate) (envsIdx envs)
+                 $ zip (shapeOperandsToList parallelShr idx) (map (\(i, _, _) -> i) loops)
+             , envsIsFirst = OP_Bool $ boolean False
+             , envsDescending = False
+             }
+        genSequential envs' (drop parallelDepth loops) $ opCodeGens opCodeGen flatOps
+
+      return_
+
+    return $ MetalCode
+      (take parallelDepth $ map sizeVar $ flattenTupR sizes)
+      kernelWork
+
+sizeVar :: Exists (Var GroundR env) -> Idx env Int
+sizeVar (Exists (Var (GroundRscalar (SingleScalarType (NumSingleType (IntegralNumType TypeInt)))) idx))
+  = idx
+sizeVar _ = internalError "Expected Int variable"
+
+-- Generates code for a Metal module.
+makeKernel
+  :: LLVM.Result (MarshalFun env) ~ ()
+  => String
+  -> Env AccessGroundR env
+  -> (Gamma env, String -> CodeGen Metal () -> LLVM Metal (Module (KernelType env)))
+makeKernel name env =
+  let (envType, extractEnv, gamma) = bindMetalEnvFromStruct env in
+  ( gamma
+  , \postfix body ->
+    snd <$> codeGenKernel
+      (name ++ postfix)
+      (LLVM.Lam (PtrPrimType envType (AddrSpace 2)) "env" . LLVM.Lam primType "thread_id")
+      (do typedef "Env" (downcast (skipTypeAlias envType)) >> extractEnv >> body)
+      (descEnvTypes env envType)
+  )
+
+metalFieldType :: AccessGroundR t -> PrimType (MarshalStorageArg t)
+metalFieldType (AccessGroundRscalar tp)
+  | Refl <- marshalScalarArg tp = bufferEltR tp
+metalFieldType (AccessGroundRbuffer _ tp) = PtrPrimType (bufferEltR tp) (AddrSpace 1)
+
+metalEnvFields :: Env AccessGroundR env -> TupR PrimType (MarshalEnv env)
+metalEnvFields Empty = TupRunit
+metalEnvFields (Push env arg) = TupRpair (metalEnvFields env) (TupRsingle (metalFieldType arg))
+
+-- TODO: it is maybe not such a good idea to replace the bindEnvFromStruct call
+-- with a purpose built bindMetalEnvFromStruct for scalability purposes
+bindMetalEnvFromStruct
+  :: forall env. Env AccessGroundR env
+  -> (PrimType (Struct (MarshalEnv env)), CodeGen Metal (), Gamma env)
+bindMetalEnvFromStruct e =
+  let (gen, gamma, _, bfrcnt) = go id e
+  in (envTp, do declareAliasScopes bfrcnt >> gen, gamma)
+  where
+    envTp = NamedPrimType "Env" $ StructPrimType False $ metalEnvFields e
+    operandEnv = LocalReference (PrimType (PtrPrimType envTp (AddrSpace 2))) "env"
+    go :: forall env'.
+          (forall t.
+            TupleIdx (MarshalEnv env') t
+            -> TupleIdx (MarshalEnv env) t)
+       -> Env AccessGroundR env'
+       -> (CodeGen Metal () -- Gets names of scopes as argument
+          , Gamma env'
+          , Int -- Next fresh scalar variable index
+          , Int -- Next fresh buffer variable index
+          )
+    go _ Empty = (return (), Empty, 0, 0)
+    go toTupleIdx (Push env (AccessGroundRscalar tp@(SingleScalarType t)))
+      | Refl <- marshalScalarArg tp
+      , Refl <- singleTypeBufferEltR t =
+        ( do
+            instr_ $ downcast $
+              namePtr := GetElementPtr (gepStruct (bufferEltR tp) operandEnv $ toTupleIdx $ TupleIdxRight TupleIdxSelf)
+            instr_ $ downcast $ name := Load NonVolatile operandPtr Nothing
+            cg
+        , gamma `Push` GroundOperandParam operand
+        , sclrcnt + 1
+        , bfrcnt
+        )
+      where
+        (cg, gamma, sclrcnt, bfrcnt) = go (toTupleIdx . TupleIdxLeft) env
+        operand    = LocalReference (PrimType $ ScalarPrimType tp) name
+        operandPtr = LocalReference (PrimType $ PtrPrimType (bufferEltR tp) (AddrSpace 2)) namePtr
+        name = fromString $ "param." ++ show sclrcnt
+        namePtr = fromString $ "param." ++ show sclrcnt ++ ".ptr"
+
+    go _ (Push _ (AccessGroundRscalar (VectorScalarType _))) =
+       internalError "Metal vector-valued scalar arguments are not implemented"
+
+    go toTupleIdx (Push env (AccessGroundRbuffer m (tp :: ScalarType t))) =
+      ( do
+        instr_ (downcast $
+          namePtr := GetElementPtr (gepStruct ptrTp operandEnv $ toTupleIdx $ TupleIdxRight TupleIdxSelf)
+          )
+        instr_ (downcast $ name := Load NonVolatile operandPtr Nothing)
+        cg
+      , gamma `Push` GroundOperandBuffer irBuffer
+      , sclrcnt
+      , bfrcnt + 1
+      )
+      where
+        (cg, gamma, sclrcnt, bfrcnt) = go (toTupleIdx . TupleIdxLeft) env
+        ptrTp = PtrPrimType (bufferEltR tp) (AddrSpace 1)
+        operand = LocalReference (PrimType ptrTp) name
+        operandPtr = LocalReference (PrimType $ PtrPrimType ptrTp (AddrSpace 2)) namePtr
+        prefix = case m of
+          In  -> "in."
+          Out -> "out."
+          Mut -> "mut."
+        name = fromString $ prefix ++ show bfrcnt
+        namePtr = fromString $ prefix ++ show sclrcnt ++ ".ptr"
+
+        bfrcnt' = case m of
+          In -> bfrcnt
+          _  -> bfrcnt + 1
+
+        alias = case m of
+          In -> Just (3, 4)
+          _  -> Just (3 * bfrcnt' + 6, 3 * bfrcnt' + 7)
+
+        irBuffer = IRBuffer operand (AddrSpace 1) NonVolatile IRBufferScopeArray alias
+
+descEnvTypes ::Env AccessGroundR env -> PrimType (Struct (MarshalEnv env)) -> CodeGen Metal [MetadataNodeID]
+descEnvTypes env envTp = do
+    innerBuff <- buildInnerArgBuff env
+
+    let (sz, al) = primSizeAlignment envTp
+
+    envDesc <- addMetadata $ const $ map Just
+      [ MetadataConstantOperand $ ScalarConstant scalarTypeInt32 0
+      , MetadataStringOperand "air.indirect_buffer"
+      , MetadataStringOperand "air.buffer_size"
+      , MetadataConstantOperand $ ScalarConstant scalarTypeInt32 $ fromIntegral sz
+      , MetadataStringOperand "air.location_index"
+      , MetadataConstantOperand $ ScalarConstant scalarTypeInt32 0
+      , MetadataConstantOperand $ ScalarConstant scalarTypeInt32 1
+      , MetadataStringOperand "air.read"
+      , MetadataStringOperand "air.address_space"
+      , MetadataConstantOperand $ ScalarConstant scalarTypeInt32 2
+      , MetadataStringOperand "air.struct_type_info"
+      , MetadataNodeOperand $ MetadataNodeReference innerBuff
+      , MetadataStringOperand "air.arg_type_size"
+      , MetadataConstantOperand $ ScalarConstant scalarTypeInt32 $ fromIntegral sz
+      , MetadataStringOperand "air.arg_type_align_size"
+      , MetadataConstantOperand $ ScalarConstant scalarTypeInt32 $ fromIntegral al
+      , MetadataStringOperand "air.arg_type_name"
+      , MetadataStringOperand "Env"
+      , MetadataStringOperand "air.arg_name"
+      , MetadataStringOperand "env"
+      ]
+
+    threadDesc <- addMetadata $ const
+      [ Just $ MetadataConstantOperand $ ScalarConstant scalarTypeInt32 1 -- second func param
+      , Just $ MetadataStringOperand "air.thread_position_in_grid"
+      , Just $ MetadataStringOperand "air.arg_type_name"
+      , Just $ MetadataStringOperand "uint"
+      ]
+
+    pure [envDesc, threadDesc]
+
+buildInnerArgBuff :: Env AccessGroundR env -> CodeGen Metal MetadataNodeID
+buildInnerArgBuff env = do
+  (_, _, fields) <- buildEnvDesc env
+  addMetadata $ const $ map Just fields
+
+buildEnvDesc :: Env AccessGroundR env -> CodeGen Metal (Int, Int, [Metadata])
+buildEnvDesc Empty = pure (0, 0, [])
+buildEnvDesc (Push env arg@(AccessGroundRscalar t)) = do
+  (n, cursor, r) <- buildEnvDesc env
+  let (sz, al) = primSizeAlignment (metalFieldType arg)
+      offset   = makeAligned cursor al
+
+  d <- addMetadata $ const $ map Just
+    [ MetadataConstantOperand $ ScalarConstant scalarTypeInt32 $ fromIntegral n
+    , MetadataStringOperand "air.indirect_constant"
+    , MetadataStringOperand "air.location_index"
+    , MetadataConstantOperand $ ScalarConstant scalarTypeInt32 $ fromIntegral n
+    , MetadataConstantOperand $ ScalarConstant scalarTypeInt32 1
+    , MetadataStringOperand "air.arg_type_name"
+    , MetadataStringOperand $ SBS.pack $ metalTypeName t
+    , MetadataStringOperand "air.arg_name"
+    , MetadataStringOperand $ SBS.pack $ "field" ++ show n
+    ]
+  pure (n + 1, offset + sz,
+    r ++
+    [ MetadataConstantOperand $ ScalarConstant scalarTypeInt32 $ fromIntegral offset
+    , MetadataConstantOperand $ ScalarConstant scalarTypeInt32 $ fromIntegral sz
+    , MetadataConstantOperand $ ScalarConstant scalarTypeInt32 0
+    , MetadataStringOperand $ SBS.pack $ metalTypeName t
+    , MetadataStringOperand $ SBS.pack $ "field" ++ show n
+    , MetadataStringOperand "air.indirect_argument"
+    , MetadataNodeOperand $ MetadataNodeReference d
+    ])
+buildEnvDesc (Push env arg@(AccessGroundRbuffer m t)) = do
+  (n, cursor, r) <- buildEnvDesc env
+
+  let (sz, al)   = primSizeAlignment (metalFieldType arg)
+      offset     = makeAligned cursor al
+      (sz', al') = primSizeAlignment (bufferEltR t)
+
+  d <- addMetadata $ const $ map Just
+    [ MetadataConstantOperand $ ScalarConstant scalarTypeInt32 $ fromIntegral n
+    , MetadataStringOperand "air.buffer"
+    , MetadataStringOperand "air.location_index"
+    , MetadataConstantOperand $ ScalarConstant scalarTypeInt32 $ fromIntegral n
+    , MetadataConstantOperand $ ScalarConstant scalarTypeInt32 1
+    , MetadataStringOperand $
+        case m of
+          In -> "air.read"
+          Out  -> "air.write"
+          Mut  -> "air.read_write"
+    , MetadataStringOperand "air.address_space"
+    , MetadataConstantOperand $ ScalarConstant scalarTypeInt32 1
+    , MetadataStringOperand "air.arg_type_size"
+    , MetadataConstantOperand $ ScalarConstant scalarTypeInt32 $ fromIntegral sz'
+    , MetadataStringOperand "air.arg_type_align_size"
+    , MetadataConstantOperand $ ScalarConstant scalarTypeInt32 $ fromIntegral al'
+    , MetadataStringOperand "air.arg_type_name"
+    , MetadataStringOperand $ SBS.pack $ metalTypeName t
+    , MetadataStringOperand "air.arg_name"
+    , MetadataStringOperand $ SBS.pack $ "field" ++ show n
+    ]
+  pure (n + 1, offset + sz,
+    r ++
+    [ MetadataConstantOperand $ ScalarConstant scalarTypeInt32 $ fromIntegral offset
+    , MetadataConstantOperand $ ScalarConstant scalarTypeInt32 $ fromIntegral sz
+    , MetadataConstantOperand $ ScalarConstant scalarTypeInt32 0
+    , MetadataStringOperand $ SBS.pack $ metalTypeName t
+    , MetadataStringOperand $ SBS.pack $ "field" ++ show n
+    , MetadataStringOperand "air.indirect_argument"
+    , MetadataNodeOperand $ MetadataNodeReference d
+    ])
+
+opCodeGen
+  :: FlatOp MetalOp env idxEnv
+  -> (LoopDepth, OpCodeGen Metal MetalOp env idxEnv)
+opCodeGen flatOp@(FlatOp op args idxArgs) = case op of
+  MetalGenerate -> defaultCodeGenGenerate args idxArgs
+  MetalMap -> defaultCodeGenMap args idxArgs
+  MetalBackpermute -> defaultCodeGenBackpermute args idxArgs
+  MetalPermute' -> defaultCodeGenPermuteUnique args idxArgs
+  MetalFold -> defaultCodeGenFold flatOp args idxArgs
+  MetalFold1 -> defaultCodeGenFold1 flatOp args idxArgs
+  MetalScan1 dir -> defaultCodeGenScan1 dir flatOp args idxArgs
+  MetalScan' dir -> defaultCodeGenScan' dir flatOp args idxArgs
+  MetalScan dir -> defaultCodeGenScan dir flatOp args idxArgs
+  _ -> internalError "opCodeGen: function not supported yet"
+  -- -- TODO: Similar to Native, we should use one global array of locks, instead of an array per permute
+  -- MetalPermute
+  --   | combineFun :>: output :>: locks :>: source :>: _ <- args
+  --   , i1 :>: i2 :>: _ :>: i3 :>: _ <- idxArgs ->
+  --     defaultCodeGenPermute
+  --       (\envs j _ -> atomically envs locks $ OP_Int j)
+  --       (combineFun :>: output :>: source :>: ArgsNil)
+  --       (i1 :>: i2 :>: i3 :>: ArgsNil)
+
+
+
+-- Helper function for converting types to metal accepted names
+-- See Chapter on Data Types in the language specs:
+-- https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf
+metalTypeName :: ScalarType t -> String
+metalTypeName (SingleScalarType (NumSingleType (IntegralNumType t))) = case t of
+  TypeInt     -> "long"
+  TypeInt8    -> "char"
+  TypeInt16   -> "short"
+  TypeInt32   -> "int"
+  TypeInt64   -> "long"
+  TypeWord    -> "ulong"
+  TypeWord8   -> "uchar"
+  TypeWord16  -> "ushort"
+  TypeWord32  -> "uint"
+  TypeWord64  -> "ulong"
+metalTypeName (SingleScalarType (NumSingleType (FloatingNumType t))) = case t of
+  TypeHalf   -> "half"
+  TypeFloat  -> "float"
+  TypeDouble -> internalError "Double not supported on Metal"
+metalTypeName (VectorScalarType _) = internalError "vector argument metadata is not implemented for Metal"

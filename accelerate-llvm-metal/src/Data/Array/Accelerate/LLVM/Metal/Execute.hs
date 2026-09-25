@@ -40,8 +40,6 @@ import Data.Array.Accelerate.LLVM.Metal.Execute.Marshal (baseToValues, Marshalle
 import Data.Array.Accelerate.LLVM.Metal.Execute.Par (Par, evalPar, liftPar, spawnPar)
 import Data.Array.Accelerate.Error (internalError)
 import Formatting
-import Data.Int (Int32)
-import Foreign.Storable (sizeOf)
 
 instance Execute UniformScheduleFun MetalKernel where
   data Linked UniformScheduleFun MetalKernel t =
@@ -118,11 +116,6 @@ executeEffect env = \case
             limit = min (toInteger (maxBound :: Int)) (toInteger (maxBound :: Word32))
 
         when (count > limit) $ unsupported "Generate element count exceeds launch limits"
-
-        case prj' (kernelOutput kernel) kernelEnv of
-          ValueBuffer _ output -> when (count > toInteger (bufferBytes output `div` sizeOf (undefined :: Int32))) $
-            unsupported "Generate output buffer is too small"
-          _ -> unsupported "expected Generate output buffer"
 
         when (count > 0) $ liftIO $ withKernelArguments (kernelObjContext (kernelMain kernel))
           metadata

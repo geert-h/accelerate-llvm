@@ -38,7 +38,8 @@ compile uid name module' = do
       ast = downcast module'
       source = P.render (P.ppLLVM llvmVer (P.ppModule ast))
 
-  liftIO $ 
+  liftIO $ do
+    writeFile "/tmp/accelerate-generated.ll" source
     withTempDirectory (takeDirectory libraryPath) "metal-build-" $ \dir -> do
       let llvmFile = dir </> "kernel.ll"
           airFile  = dir </> "kernel.air"

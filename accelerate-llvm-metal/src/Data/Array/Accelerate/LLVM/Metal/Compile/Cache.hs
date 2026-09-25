@@ -8,5 +8,5 @@ import Data.Array.Accelerate.LLVM.Compile.Cache
 import Data.Array.Accelerate.LLVM.Metal.Target (Metal)
 
 instance Persistent Metal where
-  targetCacheTemplate = pure "metal/should-be-generated/kernel.metallib"
+  targetCacheTemplate = pure "metal/kernel.metallib"
 

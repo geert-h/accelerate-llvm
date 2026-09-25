@@ -2,6 +2,7 @@
 {-# LANGUAGE GADTs               #-}
 {-# LANGUAGE OverloadedStrings   #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE LambdaCase #-}
 
 module Data.Array.Accelerate.LLVM.Metal.Kernel
   ( MetalKernel(..)
@@ -12,46 +13,41 @@ module Data.Array.Accelerate.LLVM.Metal.Kernel
 
 import Control.DeepSeq (rnf)
 import System.IO.Unsafe (unsafePerformIO)
-import Data.Int (Int32)
 import Data.String (fromString)
 
 import Data.Array.Accelerate.Analysis.Hash.Operation (hashOperation)
 import Data.Array.Accelerate.AST.Idx (Idx)
 import Data.Array.Accelerate.AST.Kernel (IsKernel(..), KernelArgR(..), OpenKernelFun(..))
 import Data.Array.Accelerate.Backend (NFData'(..))
-import Data.Array.Accelerate.Pretty.Schedule (PrettyKernel(..), PrettyKernelStyle(..))
 import Data.Array.Accelerate.Error (internalError)
 import Data.Array.Accelerate.Type (ScalarType(..), SingleDict(..), singleDict)
 import Data.Array.Accelerate.LLVM.CodeGen.Environment (sizeOfEnv)
 
 import Data.Array.Accelerate.LLVM.Metal.CodeGen (MetalCode(..), codegen)
-import Data.Array.Accelerate.LLVM.Metal.Compile (withCompiledModule)
+import Data.Array.Accelerate.LLVM.Metal.Compile (compile)
 import Data.Array.Accelerate.LLVM.Metal.State (evalMetal, defaultTarget)
 import Data.Array.Accelerate.LLVM.Compile.Cache (UID)
-import qualified Data.Array.Accelerate.LLVM.Metal.Link as Link
-import Data.Array.Accelerate.LLVM.Metal.Link.Object (KernelObject)
-import Data.Array.Accelerate.LLVM.Metal.Operation (MetalOp)
-import Data.Array.Accelerate.Array.Buffer (Buffer)
+import Data.Array.Accelerate.LLVM.Metal.Operation (MetalOp (..))
 import Foreign.Ptr (Ptr)
 import Data.Word (Word64)
 import Foreign.Storable (alignment, sizeOf)
-import Control.Monad.IO.Class (liftIO)
-import Data.Array.Accelerate.LLVM.Metal.Target (metalContext)
+import Data.Array.Accelerate.AST.Schedule (generateKernelNameAndDescription)
+import Data.Array.Accelerate.AST.Exp
+import Data.Array.Accelerate.LLVM.Metal.Link
+import Data.Array.Accelerate.Pretty.Schedule
 
 data MetalKernel env = MetalKernel
   { kernelUID      :: !UID
   , kernelMain     :: !KernelObject
   , kernelElements :: ![Idx env Int]
-  , kernelOutput   :: !(Idx env (Buffer Int32))
-  , kernelName     :: !String
+  , kernelDescDetail :: String
+  , kernelDescBrief  :: String
   }
 
 instance NFData' MetalKernel where
-  rnf' (MetalKernel uid executable elements output name) =
-    uid `seq` executable `seq` rnf elements `seq` rnf output `seq` rnf name
+  rnf' (MetalKernel uid executable elements desc brief) =
+    uid `seq` executable `seq` rnf elements `seq` rnf desc `seq` rnf brief
 
--- Kind of a misleading name, it stores the size and alignment of the kernel's argument buffer
--- I propose to rename it to ArgumentBufferLayout or something along those lines
 data MetalKernelMetadata f = MetalKernelMetadata
   { kernelArgSize       :: !Int
   , kernelArgsAlignment :: !Int
@@ -92,24 +88,43 @@ instance IsKernel MetalKernel where
 
   compileKernel parameterTypes cluster args =
     unsafePerformIO $ evalMetal defaultTarget $ do
-      let uid = hashOperation cluster args
 
-      generated <- codegen ("generate_" ++ show uid) parameterTypes cluster args
-
-      executable <- liftIO $ withCompiledModule (metalCodeSource generated) $ \path ->
-        Link.loadKernel (metalContext defaultTarget) path (metalCodeName generated)
+      generated <- codegen fullName parameterTypes cluster args
+      obj <- compile uid (fromString fullName) (metalCodeWork generated)
+      exec <- link obj
 
       pure MetalKernel
-        { kernelUID      = uid
-        , kernelMain     = executable
-        , kernelElements = metalCodeElements generated
-        , kernelOutput   = metalCodeOutput generated
-        , kernelName     = metalCodeName generated
+        { kernelUID        = uid
+        , kernelMain       = exec
+        , kernelElements   = metalCodeElements generated
+        , kernelDescDetail = detail
+        , kernelDescBrief  = brief
         }
+      where
+        fullName = name ++ "-" ++ show uid
+        uid = hashOperation cluster args
+        (name, detail, brief) = generateKernelNameAndDescription operationName cluster
 
   encodeKernel = Left . kernelUID
 
 instance PrettyKernel MetalKernel where
   prettyKernel =
-    PrettyKernelBody False $ \_ kernel ->
-      fromString (kernelName kernel)
+    PrettyKernelBody False $ \_ _kernel ->
+      fromString "still in the works"
+
+operationName :: MetalOp t -> (Int, String, String)
+operationName = \case
+  MetalMap               -> (2, "map", "maps")
+  MetalBackpermute       -> (1, "backpermute", "backpermutes")
+  MetalGenerate          -> (2, "generate", "generates")
+  MetalPermute           -> (5, "permute", "permutes")
+  MetalPermute'          -> (5, "permute", "permutes")
+  MetalScan LeftToRight  -> (4, "scanl", "scanls")
+  MetalScan RightToLeft  -> (4, "scanr", "scanrs")
+  MetalScan1 LeftToRight -> (4, "scanl", "scanls")
+  MetalScan1 RightToLeft -> (4, "scanr", "scanrs")
+  MetalScan' LeftToRight -> (4, "scanl", "scanls")
+  MetalScan' RightToLeft -> (4, "scanr", "scanrs")
+  MetalFold              -> (3, "fold", "folds")
+  MetalFold1             -> (3, "fold", "folds")
+
