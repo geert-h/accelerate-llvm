@@ -38,7 +38,7 @@ import Data.Array.Accelerate.Representation.Type (TypeR, TupR (..))
 import Data.Array.Accelerate.Type
 import Data.Array.Accelerate.Analysis.Match
 import Data.Array.Accelerate.Trafo.Partitioning.ILP.ConstraintLanguage (Constraint(..))
-import Data.Array.Accelerate.Trafo.Partitioning.ILP.LinearConstraint (Bounds, Number(..), Constants(..), Var(..), equal, lower)
+import Data.Array.Accelerate.Trafo.Partitioning.ILP.LinearConstraint (Bounds, Number(..), Constants(..), Var(..), equal, lower, (.==.))
 import Data.Array.Accelerate.Trafo.Partitioning.ILP.Solver (Solution)
 import Lens.Micro
 import Lens.Micro.Mtl
@@ -54,7 +54,6 @@ data MetalOp t where
   MetalGenerate  :: MetalOp (Fun' (sh -> t)              -> Out sh  t -> ())
   MetalPermute   :: MetalOp (Fun' (e -> e -> e)
                          -> Mut sh' e
-                         -> Mut sh' Word32
                          -> In sh (PrimMaybe (sh', e))
                          -> ())
   MetalPermute'  :: MetalOp (Mut sh' e
@@ -131,24 +130,28 @@ instance LowerAcc MetalOp where
     = Exec (MetalScan1 dir) (f :>: i :>: o :>: ArgsNil)
   mkScan' dir f seed i@(ArgArray In (ArrayR shr ty) sh buf) o1 o2
     = Exec (MetalScan' dir) (f :>: seed :>: i :>: o1 :>: o2 :>: ArgsNil)
-  mkPermute     (Just a) b@(ArgArray _ (ArrayR shr _) sh _) c
-    | DeclareVars lhs w lock <- declareVars $ buffersR $ TupRsingle scalarTypeWord32
-    = aletUnique lhs 
-        (Alloc shr scalarTypeWord32 $ groundToExpVar (shapeType shr) sh)
-        $ alet LeftHandSideUnit
-          (Exec MetalGenerate ( -- TODO: The old pipeline used a 'memset 0' instead, which sounds faster...
-                ArgFun (Lam (LeftHandSideWildcard (shapeType shr)) $ Body $ Const scalarTypeWord32 0)
-            :>: ArgArray Out (ArrayR shr (TupRsingle scalarTypeWord32)) (weakenVars w sh) (lock weakenId) 
-            :>: ArgsNil))
-          (Exec MetalPermute (
-                weaken w a 
-            :>: weaken w b 
-            :>: ArgArray Mut (ArrayR shr (TupRsingle scalarTypeWord32)) (weakenVars w sh) (lock weakenId) 
-            :>: weaken w c 
-            :>: ArgsNil))
-  mkPermute Nothing a b = Exec MetalPermute' (a :>: b :>: ArgsNil)
-  {-mkFold a (Just seed) b c = Exec MetalFold (a :>: seed :>: b :>: c :>: ArgsNil)
-  mkFold a Nothing b c = Exec MetalFold1 (a :>: b :>: c :>: ArgsNil) -}
+  mkPermute (Just a) b c = Exec MetalPermute (a :>: b :>: c :>: ArgsNil)
+  mkPermute Nothing a b = Exec MetalPermute' (a :>: b :>: ArgsNil) 
+  -- Below is copied over from the PTX backend, I do not think it is needed anymore
+  -- This is because let the runtime allocate the locks array buffer
+  -- mkPermute     (Just a) b@(ArgArray _ (ArrayR shr _) sh _) c
+  --   | DeclareVars lhs w lock <- declareVars $ buffersR $ TupRsingle scalarTypeWord32
+  --   = aletUnique lhs 
+  --       (Alloc shr scalarTypeWord32 $ groundToExpVar (shapeType shr) sh)
+  --       $ alet LeftHandSideUnit
+  --         (Exec MetalGenerate ( -- TODO: The old pipeline used a 'memset 0' instead, which sounds faster...
+  --               ArgFun (Lam (LeftHandSideWildcard (shapeType shr)) $ Body $ Const scalarTypeWord32 0)
+  --           :>: ArgArray Out (ArrayR shr (TupRsingle scalarTypeWord32)) (weakenVars w sh) (lock weakenId) 
+  --           :>: ArgsNil))
+  --         (Exec MetalPermute (
+  --               weaken w a 
+  --           :>: weaken w b 
+  --           -- :>: ArgArray Mut (ArrayR shr (TupRsingle scalarTypeWord32)) (weakenVars w sh) (lock weakenId) 
+  --           :>: weaken w c 
+  --           :>: ArgsNil))
+  -- mkPermute Nothing a b = Exec MetalPermute' (a :>: b :>: ArgsNil)
+  mkFold a (Just seed) b c = Exec MetalFold (a :>: seed :>: b :>: c :>: ArgsNil)
+  mkFold a Nothing b c = Exec MetalFold1 (a :>: b :>: c :>: ArgsNil)
 
 instance SimplifyOperation MetalOp where
   detectCopy MetalMap         = detectMapCopies
@@ -209,10 +212,10 @@ instance SetOpIndices MetalOp where
     | otherwise
     = Nothing
   setOpIndices _ MetalFold1 _ _ = error "Missing indices for MetalFold1"
-  setOpIndices indexVar MetalPermute (_ :>: _ :>: _ :>: ArgArray _ (ArrayR shr _) _ _ :>: _) (_ :: IdxArgs idxEnv f)
+  setOpIndices indexVar MetalPermute (_ :>: _ :>: ArgArray _ (ArrayR shr _) _ _ :>: _) (_ :: IdxArgs idxEnv f)
     | Just i <- findIndex shr
     = Just $ Right $
-      IdxArgNone :>: IdxArgNone :>: IdxArgNone :>: IdxArgIdx (rank shr) i :>: ArgsNil
+      IdxArgNone :>: IdxArgNone :>: IdxArgIdx (rank shr) i :>: ArgsNil
     | otherwise
     = Nothing
     where
@@ -303,18 +306,18 @@ instance MakesILP MetalOp where
       Just Refl -> (<> mkUnitInplacePaths (Number nComps * Number nComps) c lIn lOut)
       _         -> (<> mkUnitInplacePaths 1 c lIn lOut)
 
-  mkGraph c MetalPermute (_fun :>: L _ lTargets :>: L _ lLocks :>: L _ lIn :>: ArgsNil) = do
+  mkGraph c MetalPermute (_fun :>: L _ lTargets :>: L _ lLocks :>: ArgsNil) = do
     let bsTargets = getLabelArrDeps lTargets
     let bsLocks   = getLabelArrDeps lLocks
-    let bsIn      = getLabelArrDeps lIn
+    -- let bsIn      = getLabelArrDeps lIn
     wsTargets <- use $ allWriters bsTargets
     wsLocks   <- use $ allWriters bsLocks
-    wsIn      <- use $ allWriters bsIn
-    fusionILP %= (wsTargets <> wsLocks <> wsIn) `allBefore` c
+    -- wsIn      <- use $ allWriters bsIn
+    -- fusionILP %= (wsTargets <> wsLocks <> wsIn) `allBefore` c
     fusionILP.constraints %= (
       <> [SameFoldSize c])
-    fusionILP.bounds %= (<> foldMap (equal (-2) . (`ReadDir` c)) (bsTargets <> bsLocks <> bsIn)
-                         <> foldMap (equal (-3) . WriteDir c)    (bsTargets <> bsLocks <> bsIn))
+    fusionILP.bounds %= (<> foldMap (equal (-2) . (`ReadDir` c)) (bsTargets <> bsLocks)
+                         <> foldMap (equal (-3) . WriteDir c)    (bsTargets <> bsLocks))
 
   mkGraph c MetalPermute' (L _ lTargets :>: L _ lIn :>: ArgsNil) = do
     let bsTargets = getLabelArrDeps lTargets

@@ -43,6 +43,11 @@ import Data.Array.Accelerate.LLVM.CodeGen.Environment
 -- -- a schedule.
 -- type Header = ((((((Ptr (Struct Int8), Ptr Int8), Word32), Word32), Word64), Ptr Word64), Ptr TracySrcloc)
 --
+-- TODO: for the header I need:
+-- - Pointer to locks
+-- - work_index
+--
+--
 -- type KernelType env
 --   -- Ptr to the kernel struct
 --   = Ptr (Struct ((Header, Struct (MarshalEnv env)), SizedArray Word))
@@ -55,7 +60,14 @@ import Data.Array.Accelerate.LLVM.CodeGen.Environment
 --   -- Only in initialization, this function returns whether the kernel should run sequentially or in parallel
 --   -> Word8
 
-type KernelType env = Ptr (Struct (MarshalEnv env)) -> Word32 -> ()
+type KernelType env
+  -- Ptr to the environment
+  = Ptr (Struct (MarshalEnv env))
+  -- Ptr to the locks array (for any permutes)
+  -> Ptr Word8
+  -- thread index
+  -> Word32
+  -> ()
 
 codeGenKernel
   :: forall f a. Result f ~ ()

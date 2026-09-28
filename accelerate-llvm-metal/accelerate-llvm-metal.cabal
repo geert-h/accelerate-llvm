@@ -38,6 +38,7 @@ library
         Data.Array.Accelerate.LLVM.Metal.Compile.Cache
         Data.Array.Accelerate.LLVM.Metal.CodeGen
         Data.Array.Accelerate.LLVM.Metal.CodeGen.Base
+        Data.Array.Accelerate.LLVM.Metal.CodeGen.Permute
         Data.Array.Accelerate.LLVM.Metal.Compile
         Data.Array.Accelerate.LLVM.Metal.Kernel
         Data.Array.Accelerate.LLVM.Metal.Link

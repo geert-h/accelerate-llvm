@@ -3,6 +3,11 @@
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeOperators #-}
+{-# LANGUAGE TypeApplications #-}
+-- {-# LANGUAGE FlexibleContexts #-}
+-- {-# LANGUAGE FlexibleInstances #-}
+-- {-# LANGUAGE UndecidableInstances #-}
+-- {-# LANGUAGE TypeFamilies #-}
 
 module Data.Array.Accelerate.LLVM.Metal.CodeGen
   ( MetalCode(..)
@@ -23,7 +28,7 @@ import Data.Array.Accelerate.Error (internalError)
 
 import qualified Data.ByteString.Short.Char8 as SBS
 import Data.Array.Accelerate.LLVM.CodeGen.Cluster (OpCodeGen, genSequential, opCodeGens)
-import Data.Array.Accelerate.LLVM.CodeGen.Default (defaultCodeGenPermuteUnique, defaultCodeGenFold, defaultCodeGenFold1, defaultCodeGenScan1, defaultCodeGenScan', defaultCodeGenScan, defaultCodeGenBackpermute, defaultCodeGenMap, defaultCodeGenGenerate)
+import Data.Array.Accelerate.LLVM.CodeGen.Default (defaultCodeGenPermuteUnique, defaultCodeGenFold, defaultCodeGenFold1, defaultCodeGenScan1, defaultCodeGenScan', defaultCodeGenScan, defaultCodeGenBackpermute, defaultCodeGenMap, defaultCodeGenGenerate, defaultCodeGenPermute)
 import Data.Array.Accelerate.LLVM.CodeGen.IR (Operands(..))
 
 import qualified LLVM.AST.Type.Function as LLVM
@@ -45,6 +50,7 @@ import Data.String
 import LLVM.AST.Type.Instruction
 import LLVM.AST.Type.Instruction.Volatile
 import Data.Array.Accelerate.Representation.Shape (shapeRFromRank)
+import Data.Array.Accelerate.LLVM.Metal.CodeGen.Permute
 
 data MetalCode env = MetalCode
   { metalCodeElements :: ![Idx env Int]
@@ -118,7 +124,7 @@ makeKernel name env =
   , \postfix body ->
     snd <$> codeGenKernel
       (name ++ postfix)
-      (LLVM.Lam (PtrPrimType envType (AddrSpace 2)) "env" . LLVM.Lam primType "thread_id")
+      (LLVM.Lam (PtrPrimType envType (AddrSpace 2)) "env" . LLVM.Lam (PtrPrimType (primType @Word8) (AddrSpace 1)) "locks_array" . LLVM.Lam primType "thread_id")
       (do typedef "Env" (downcast (skipTypeAlias envType)) >> extractEnv >> body)
       (descEnvTypes env envType)
   )
@@ -158,10 +164,10 @@ bindMetalEnvFromStruct e =
       | Refl <- marshalScalarArg tp
       , Refl <- singleTypeBufferEltR t =
         ( do
+            cg
             instr_ $ downcast $
               namePtr := GetElementPtr (gepStruct (bufferEltR tp) operandEnv $ toTupleIdx $ TupleIdxRight TupleIdxSelf)
             instr_ $ downcast $ name := Load NonVolatile operandPtr Nothing
-            cg
         , gamma `Push` GroundOperandParam operand
         , sclrcnt + 1
         , bfrcnt
@@ -178,11 +184,11 @@ bindMetalEnvFromStruct e =
 
     go toTupleIdx (Push env (AccessGroundRbuffer m (tp :: ScalarType t))) =
       ( do
+        cg
         instr_ (downcast $
           namePtr := GetElementPtr (gepStruct ptrTp operandEnv $ toTupleIdx $ TupleIdxRight TupleIdxSelf)
           )
         instr_ (downcast $ name := Load NonVolatile operandPtr Nothing)
-        cg
       , gamma `Push` GroundOperandBuffer irBuffer
       , sclrcnt
       , bfrcnt + 1
@@ -238,14 +244,33 @@ descEnvTypes env envTp = do
       , MetadataStringOperand "env"
       ]
 
+    locksArrayDesc <- addMetadata $ const $ map Just
+      [ MetadataConstantOperand $ ScalarConstant scalarTypeInt32 0 -- second func param
+      , MetadataStringOperand "air.buffer"
+      , MetadataStringOperand "air.location_index"
+      , MetadataConstantOperand $ ScalarConstant scalarTypeInt32 1
+      , MetadataConstantOperand $ ScalarConstant scalarTypeInt32 1
+      , MetadataStringOperand "air.read_write"
+      , MetadataStringOperand "air.address_space"
+      , MetadataConstantOperand $ ScalarConstant scalarTypeInt32 1
+      , MetadataStringOperand "air.arg_type_size"
+      , MetadataConstantOperand $ ScalarConstant scalarTypeInt32 1
+      , MetadataStringOperand "air.arg_type_align_size"
+      , MetadataConstantOperand $ ScalarConstant scalarTypeInt32 1
+      , MetadataStringOperand "air.arg_type_name"
+      , MetadataStringOperand "air.uchar"
+      , MetadataStringOperand "air.arg_name"
+      , MetadataStringOperand "air.locks_array"
+      ]
+
     threadDesc <- addMetadata $ const
-      [ Just $ MetadataConstantOperand $ ScalarConstant scalarTypeInt32 1 -- second func param
+      [ Just $ MetadataConstantOperand $ ScalarConstant scalarTypeInt32 2 -- third func param
       , Just $ MetadataStringOperand "air.thread_position_in_grid"
       , Just $ MetadataStringOperand "air.arg_type_name"
       , Just $ MetadataStringOperand "uint"
       ]
 
-    pure [envDesc, threadDesc]
+    pure [envDesc, locksArrayDesc, threadDesc]
 
 buildInnerArgBuff :: Env AccessGroundR env -> CodeGen Metal MetadataNodeID
 buildInnerArgBuff env = do
@@ -333,8 +358,11 @@ opCodeGen flatOp@(FlatOp op args idxArgs) = case op of
   MetalScan1 dir -> defaultCodeGenScan1 dir flatOp args idxArgs
   MetalScan' dir -> defaultCodeGenScan' dir flatOp args idxArgs
   MetalScan dir -> defaultCodeGenScan dir flatOp args idxArgs
-  _ -> internalError "opCodeGen: function not supported yet"
-  -- -- TODO: Similar to Native, we should use one global array of locks, instead of an array per permute
+  -- TODO: Similar to Native, we should use one global array of locks, instead of an array per permute
+  MetalPermute
+    | (_ :>: output :>: _ :>: _) <- args ->
+      defaultCodeGenPermute (\envs j _ -> atomically envs output $ OP_Int j) args idxArgs
+  -- Copied from PTX opCodeGen
   -- MetalPermute
   --   | combineFun :>: output :>: locks :>: source :>: _ <- args
   --   , i1 :>: i2 :>: _ :>: i3 :>: _ <- idxArgs ->

@@ -1,13 +1,12 @@
 module Data.Array.Accelerate.LLVM.Metal.Compile
-  (withCompiledModule
-  , compile
+  ( compile
   , ObjectR(..)
   ) where
 
 import Control.Monad (unless)
 import System.Exit (ExitCode(..))
 import System.FilePath ((</>), takeDirectory)
-import System.IO.Temp (withSystemTempDirectory, withTempDirectory)
+import System.IO.Temp (withTempDirectory)
 import System.Process (readProcessWithExitCode)
 import Data.Array.Accelerate.Error (internalError)
 import Formatting (string)
@@ -54,18 +53,6 @@ compile uid name module' = do
    , objSym = name
    , objPath = libraryPath
    }
-
--- Temporary compiled module runner
-withCompiledModule :: String -> (FilePath -> IO a) -> IO a
-withCompiledModule source action =
-  withSystemTempDirectory "accelerate-metal" $ \dir -> do
-    let llvmFile = dir </> "kernel.ll"
-        airFile  = dir </> "kernel.air"
-        libFile  = dir </> "kernel.metallib"
-    writeFile llvmFile source
-    execXcrun [ "-sdk", "macosx", "metal", "-c", llvmFile, "-o", airFile, "-Xclang", "-opaque-pointers"]
-    execXcrun [ "-sdk", "macosx", "metallib", airFile, "-o", libFile]
-    action libFile
 
 -- this function runs xcrun with the given arguments above
 -- for now this is enough because we only pass on simple generate file
