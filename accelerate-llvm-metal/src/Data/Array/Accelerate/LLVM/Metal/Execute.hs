@@ -40,6 +40,8 @@ import Data.Array.Accelerate.LLVM.Metal.Execute.Marshal (baseToValues, Marshalle
 import Data.Array.Accelerate.LLVM.Metal.Execute.Par (Par, evalPar, liftPar, spawnPar)
 import Data.Array.Accelerate.Error (internalError)
 import Formatting
+import qualified Data.Array.Accelerate.LLVM.Metal.Array.Prim as Buffer
+import Foreign.Marshal.Utils (fillBytes)
 
 instance Execute UniformScheduleFun MetalKernel where
   data Linked UniformScheduleFun MetalKernel t =
@@ -117,12 +119,18 @@ executeEffect env = \case
 
         when (count > limit) $ unsupported "Generate element count exceeds launch limits"
 
-        when (count > 0) $ liftIO $ withKernelArguments (kernelObjContext (kernelMain kernel))
-          metadata
-          env
-          function
-          arguments
-          (\packed resources -> launch (kernelMain kernel) packed resources (fromInteger count))
+        when (count > 0) $ liftIO $
+          let context = kernelObjContext (kernelMain kernel) in
+          Buffer.withNewBuffer context (16 * 1024) $ \locks ->
+          Buffer.withBufferContents locks $ \contents ->  do -- TODO: move the locks_array size to some more logical place
+            fillBytes contents 0 (bufferBytes locks) -- initialise all bytes in lock array to 0
+            withKernelArguments
+              context
+              metadata
+              env
+              function
+              arguments
+              (\packed resources -> launch (kernelMain kernel) packed locks resources (fromInteger count))
 
   _ -> unsupported "assertion/trace execution is not implemented"
 
@@ -136,13 +144,16 @@ unsupported message =
   internalError string ("accelerate-llvm-metal: " ++ message)
 
 -- launches a kernel
-launch :: KernelObject -> MetalBuffer -> [Ptr RawBuffer] -> Int -> IO ()
-launch kernel args resrs count
+launch :: KernelObject -> MetalBuffer -> MetalBuffer -> [Ptr RawBuffer] -> Int -> IO ()
+launch kernel args locks resrs count
   | count < 0 = internalError string "Negative Metal thread count"
   | toInteger count > toInteger (maxBound :: Word32) = internalError string "Metal thread count exceeds Word32"
   | count == 0 = pure ()
   | otherwise = withContext (kernelObjContext kernel) $ \ctx -> withKernelObject kernel $ \pipe ->
-      withBuffer args $ \argBfr -> withArrayLen resrs $ \resrCnt resrArr -> allocaBytes 1024 $ \err -> do
-        status <- FFI.runKernel ctx pipe argBfr (fromIntegral count) resrArr (fromIntegral resrCnt) err 1024
-        when (status /= 0) $ peekCString err >>= internalError string
+      withBuffer args $ \argBfr ->
+        withBuffer locks $ \locksBfr ->
+          withArrayLen resrs $ \resrCnt resrArr ->
+            allocaBytes 1024 $ \err -> do
+              status <- FFI.runKernel ctx pipe argBfr locksBfr (fromIntegral count) resrArr (fromIntegral resrCnt) err 1024
+              when (status /= 0) $ peekCString err >>= internalError string
 

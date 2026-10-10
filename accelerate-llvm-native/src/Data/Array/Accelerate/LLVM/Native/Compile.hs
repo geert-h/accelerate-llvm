@@ -197,6 +197,7 @@ compile uid name module' = do
         let unoptimisedText = P.render (P.ppLLVM llvmver (P.ppModule ast))
         Debug.when Debug.verbose $ do
           Debug.traceM Debug.dump_cc ("Unoptimised LLVM IR:\n" % string) unoptimisedText
+        writeFile "/tmp/native-generated.ll" unoptimisedText
 
         dVerbose <- Debug.getFlag Debug.verbose
         dDumpCC <- Debug.getFlag Debug.dump_cc

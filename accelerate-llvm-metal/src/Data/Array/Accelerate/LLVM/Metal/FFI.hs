@@ -10,7 +10,6 @@ module Data.Array.Accelerate.LLVM.Metal.FFI
   , pipelineLoad
   , pipelineDestroy
   , pipelineFinalizer
-  , generateI32
   , RawBuffer
   , bufferCreate
   , bufferDestroy
@@ -81,16 +80,6 @@ foreign import ccall safe "acc_metal_buffer_read"
     -> CSize
     -> IO CInt
 
-foreign import ccall safe "acc_metal_generate_i32"
-  generateI32
-    :: Ptr RawContext
-    -> Ptr RawPipeline
-    -> Word32
-    -> Ptr RawBuffer
-    -> CString
-    -> CSize
-    -> IO CInt
-
 foreign import ccall safe "acc_metal_buffer_contents"
   bufferContents
     :: Ptr RawBuffer
@@ -110,6 +99,7 @@ foreign import ccall safe "acc_metal_run_kernel"
   runKernel
     :: Ptr RawContext
     -> Ptr RawPipeline
+    -> Ptr RawBuffer
     -> Ptr RawBuffer
     -> Word32
     -> Ptr (Ptr RawBuffer)

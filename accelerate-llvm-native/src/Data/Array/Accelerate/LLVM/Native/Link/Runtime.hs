@@ -59,7 +59,6 @@ loadSharedObject nm path = do
   so      <- dlopen' path
 
   let s = B8.unpack $ nm
-  writeFile "/tmp/native-generated.ll" s
   Debug.traceM Debug.dump_ld ("ld: looking up symbol " % string) s
   sym <- dlsym so s
   object_code <- newLifetime so

@@ -34,7 +34,6 @@ import qualified Data.Array.Accelerate.LLVM.Metal.Array.Prim as Buffer
 import Data.Array.Accelerate.LLVM.Metal.Execute.Environment
 
 import Control.Monad (when)
-import Foreign.Marshal.Utils (fillBytes)
 import Foreign.Ptr (Ptr, nullPtr)
 import Foreign.Storable (pokeByteOff)
 
@@ -120,9 +119,6 @@ withKernelArguments context metadata outer function actuals action =
   -- allocates the argument buffer
   -- Metal requires a nonzero allocation, even for an empty argument list
   Buffer.withNewBuffer context (max 1 bytes) $ \arguments -> Buffer.withBufferContents arguments $ \contents -> do
-      -- TODO: Idk whether this is necessary but it zeroes the content of the buffer (also padding)
-      -- for the generate case, it works with and without it, I'll just leave it for now just to be safe
-      fillBytes contents 0 (bufferBytes arguments)
       go 0 [] function actuals arguments contents
     where
       go :: forall inner remaining.                    -- these changes between recursive call, so they need to be polymorphic

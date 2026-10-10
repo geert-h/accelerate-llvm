@@ -64,7 +64,12 @@ type KernelType env
   -- Ptr to the environment
   = Ptr (Struct (MarshalEnv env))
   -- Ptr to the locks array (for any permutes)
-  -> Ptr Word8
+  -- unlike the Native backend, we use unsigned integers here for the lock array.
+  -- The Metal Shading Language Specifications in the section Atomic Data Types says the following:
+  -- Metal supports atomic<T>, where T can be int, int32_t, uint, uint32_t, bool, or
+  -- ulong for all OSes that support Metal 2.4 and later, or T can be float for all OSes that
+  -- support Metal 3 and later.
+  -> Ptr Word32
   -- thread index
   -> Word32
   -> ()

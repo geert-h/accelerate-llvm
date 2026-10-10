@@ -69,9 +69,12 @@ void *acc_metal_pipeline_load(void *context_pointer, const char *path,
     }
 
     NSError *failure = nil;
+    printf("function: %s\n", function_name);
+    printf("before library\n");
     id<MTLLibrary> library =
         [context.device newLibraryWithURL:[NSURL fileURLWithPath:filename]
                                     error:&failure];
+    printf("after library\n");
     if (!library) {
       snprintf(error, error_size, "%s",
                failure.localizedDescription.UTF8String
@@ -86,9 +89,12 @@ void *acc_metal_pipeline_load(void *context_pointer, const char *path,
       return NULL;
     }
 
+    printf("before pipeline\n");
     id<MTLComputePipelineState> pipeline =
         [context.device newComputePipelineStateWithFunction:function
                                                       error:&failure];
+    printf("after pipeline\n");
+
     if (!pipeline) {
       snprintf(error, error_size, "%s",
                failure.localizedDescription.UTF8String
@@ -96,6 +102,7 @@ void *acc_metal_pipeline_load(void *context_pointer, const char *path,
       return NULL;
     }
 
+    printf("returning from pipeline load\n");
     return (__bridge_retained void *)pipeline;
   }
 }
@@ -105,78 +112,6 @@ void acc_metal_pipeline_deconstruct(void *pointer) {
     id<MTLComputePipelineState> pipeline =
         (__bridge_transfer id<MTLComputePipelineState>)pointer;
     (void)pipeline;
-  }
-}
-
-int acc_metal_generate_i32(void *context_pointer, void *pipeline_pointer,
-                           uint32_t n, void *buffer_pointer, char *error,
-                           size_t error_size) {
-  if (n == 0)
-    return 0;
-
-  @autoreleasepool {
-    AccMetalContext *context = (__bridge AccMetalContext *)context_pointer;
-    id<MTLComputePipelineState> pipeline =
-        (__bridge id<MTLComputePipelineState>)pipeline_pointer;
-    id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)buffer_pointer;
-
-    if (!context || !pipeline || !buffer) {
-      snprintf(error, error_size, "Invalid execution argument");
-      return 1;
-    }
-
-    if ((size_t)n > SIZE_MAX / sizeof(int32_t)) {
-      snprintf(error, error_size, "Output size overflow");
-      return 1;
-    }
-
-    size_t bytes = (size_t)n * sizeof(int32_t);
-    if (bytes > buffer.length || buffer.device != context.device ||
-        pipeline.device != context.device) {
-      snprintf(error, error_size, "Output too small or Metal device mismatch");
-      return 1;
-    }
-
-    NSUInteger width = MIN(pipeline.threadExecutionWidth,
-                           pipeline.maxTotalThreadsPerThreadgroup);
-
-    if (width == 0) {
-      snprintf(error, error_size, "Invalid pipline threadgroup size");
-      return 1;
-    }
-
-    id<MTLCommandBuffer> command = [context.queue commandBuffer];
-    if (!command) {
-      snprintf(error, error_size, "Could not construct command buffer");
-      return 1;
-    }
-
-    id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
-    if (!encoder) {
-      snprintf(error, error_size, "Could not construct compute encoder");
-      return 1;
-    }
-
-    [encoder setComputePipelineState:pipeline];
-    [encoder setBuffer:buffer offset:0 atIndex:0];
-    [encoder setBytes:&n length:sizeof(n) atIndex:1];
-
-    NSUInteger groups = 1 + ((NSUInteger)n - 1) / width;
-    [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
-    [encoder endEncoding];
-
-    [command commit];
-    [command waitUntilCompleted];
-
-    if (command.status != MTLCommandBufferStatusCompleted) {
-      snprintf(error, error_size, "%s",
-               command.error.localizedDescription.UTF8String
-                   ?: "Metal execution failed");
-      return 1;
-    }
-
-    return 0;
   }
 }
 
@@ -266,9 +201,10 @@ int acc_metal_buffer_gpu_address(void *buffer_pointer, uint64_t *address,
 }
 
 int acc_metal_run_kernel(void *context_pointer, void *pipeline_pointer,
-                         void *arguments_pointer, uint32_t thread_count,
-                         void *const *resources, size_t resource_count,
-                         char *error, size_t error_size) {
+                         void *arguments_pointer, void *locks_pointer,
+                         uint32_t thread_count, void *const *resources,
+                         size_t resource_count, char *error,
+                         size_t error_size) {
   if (thread_count == 0)
     return 0;
 
@@ -277,15 +213,16 @@ int acc_metal_run_kernel(void *context_pointer, void *pipeline_pointer,
     id<MTLComputePipelineState> pipeline =
         (__bridge id<MTLComputePipelineState>)pipeline_pointer;
     id<MTLBuffer> arguments = (__bridge id<MTLBuffer>)arguments_pointer;
+    id<MTLBuffer> locks = (__bridge id<MTLBuffer>)locks_pointer;
 
-    if (!context || !pipeline || !arguments ||
+    if (!context || !pipeline || !arguments || !locks ||
         (resource_count != 0 && !resources)) {
       snprintf(error, error_size, "Invalid kernel launch argument");
       return 1;
     }
 
     if (pipeline.device != context.device ||
-        arguments.device != context.device) {
+        arguments.device != context.device || locks.device != context.device) {
       snprintf(error, error_size, "Metal device mismatch");
       return 1;
     }
@@ -308,11 +245,6 @@ int acc_metal_run_kernel(void *context_pointer, void *pipeline_pointer,
       return 1;
     }
 
-    // Keep padded thread indices representable by the kernel's uint32 ID
-    uint64_t padded = (((uint64_t)thread_count + width - 1) / width) * width;
-    if (padded > (uint64_t)UINT32_MAX + 1)
-      width = 1;
-
     id<MTLCommandBuffer> command = [context.queue commandBuffer];
     if (!command) {
       snprintf(error, error_size, "Could not construct command buffer");
@@ -327,6 +259,7 @@ int acc_metal_run_kernel(void *context_pointer, void *pipeline_pointer,
 
     [encoder setComputePipelineState:pipeline];
     [encoder setBuffer:arguments offset:0 atIndex:0];
+    [encoder setBuffer:locks offset:0 atIndex:1];
 
     // Conservitavely declare both reads and writes for now
     for (size_t i = 0; i < resource_count; ++i) {

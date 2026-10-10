@@ -124,7 +124,7 @@ makeKernel name env =
   , \postfix body ->
     snd <$> codeGenKernel
       (name ++ postfix)
-      (LLVM.Lam (PtrPrimType envType (AddrSpace 2)) "env" . LLVM.Lam (PtrPrimType (primType @Word8) (AddrSpace 1)) "locks_array" . LLVM.Lam primType "thread_id")
+      (LLVM.Lam (PtrPrimType envType (AddrSpace 2)) "env" . LLVM.Lam (PtrPrimType (primType @Word32) (AddrSpace 1)) "locks_array" . LLVM.Lam primType "thread_id")
       (do typedef "Env" (downcast (skipTypeAlias envType)) >> extractEnv >> body)
       (descEnvTypes env envType)
   )
@@ -245,7 +245,7 @@ descEnvTypes env envTp = do
       ]
 
     locksArrayDesc <- addMetadata $ const $ map Just
-      [ MetadataConstantOperand $ ScalarConstant scalarTypeInt32 0 -- second func param
+      [ MetadataConstantOperand $ ScalarConstant scalarTypeInt32 1 -- second func param
       , MetadataStringOperand "air.buffer"
       , MetadataStringOperand "air.location_index"
       , MetadataConstantOperand $ ScalarConstant scalarTypeInt32 1
@@ -254,13 +254,13 @@ descEnvTypes env envTp = do
       , MetadataStringOperand "air.address_space"
       , MetadataConstantOperand $ ScalarConstant scalarTypeInt32 1
       , MetadataStringOperand "air.arg_type_size"
-      , MetadataConstantOperand $ ScalarConstant scalarTypeInt32 1
+      , MetadataConstantOperand $ ScalarConstant scalarTypeInt32 4
       , MetadataStringOperand "air.arg_type_align_size"
-      , MetadataConstantOperand $ ScalarConstant scalarTypeInt32 1
+      , MetadataConstantOperand $ ScalarConstant scalarTypeInt32 4
       , MetadataStringOperand "air.arg_type_name"
-      , MetadataStringOperand "air.uchar"
+      , MetadataStringOperand "uint"
       , MetadataStringOperand "air.arg_name"
-      , MetadataStringOperand "air.locks_array"
+      , MetadataStringOperand "locks_array"
       ]
 
     threadDesc <- addMetadata $ const
