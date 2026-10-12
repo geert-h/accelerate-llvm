@@ -203,7 +203,7 @@ bindMetalEnvFromStruct e =
           Out -> "out."
           Mut -> "mut."
         name = fromString $ prefix ++ show bfrcnt
-        namePtr = fromString $ prefix ++ show sclrcnt ++ ".ptr"
+        namePtr = fromString $ prefix ++ show bfrcnt ++ ".ptr"
 
         bfrcnt' = case m of
           In -> bfrcnt
