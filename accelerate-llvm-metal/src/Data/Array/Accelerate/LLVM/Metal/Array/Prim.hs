@@ -4,6 +4,7 @@ module Data.Array.Accelerate.LLVM.Metal.Array.Prim
   ( mallocBuffer
   , withNewBuffer
   , copyToHost
+  , copyToDevice
   , withBufferContents
   , withBufferGPUAddress
   ) where
@@ -22,6 +23,7 @@ import Data.Array.Accelerate.LLVM.Metal.Context
 import Data.Array.Accelerate.LLVM.Metal.FFI
 import Formatting (string)
 import Data.Array.Accelerate.Error (internalError)
+import Foreign.Marshal.Utils (copyBytes)
 
 mallocBuffer :: Context -> Int -> IO MetalBuffer
 mallocBuffer context bytes
@@ -40,6 +42,15 @@ mallocBuffer context bytes
 
 withNewBuffer :: Context -> Int -> (MetalBuffer -> IO a) -> IO a
 withNewBuffer context bytes = bracket (mallocBuffer context bytes) releaseBuffer
+
+copyToDevice :: MetalBuffer -> Int -> Ptr a -> IO ()
+copyToDevice buffer bytes source
+  | bytes < 0 || bytes > bufferBytes buffer = internalError "Buffer read exceeds allocation"
+  | bytes == 0 = pure ()
+  | otherwise =
+    withBufferContents buffer $ \destination ->
+      copyBytes destination (castPtr source) bytes
+
 
 -- GPU writes must have completed before calling this
 copyToHost :: MetalBuffer -> Int -> Ptr a -> IO ()

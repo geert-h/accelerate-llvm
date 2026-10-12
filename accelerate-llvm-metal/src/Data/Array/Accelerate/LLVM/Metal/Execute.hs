@@ -54,10 +54,8 @@ instance Execute UniformScheduleFun MetalKernel where
 
 executeFun :: UniformScheduleFun MetalKernel () f -> IOFun f
 executeFun (Sbody body) = evalMetal defaultTarget $ evalPar $ execute Empty body
-
 executeFun (Slam lhs1 (Slam lhs2 function)) =
   curry (executeFun (Slam (LeftHandSidePair lhs1 lhs2) function))
-
 executeFun (Slam lhs (Sbody body)) = \arguments ->
   evalMetal defaultTarget $ evalPar $ do
     values <- liftIO $ baseToValues (lhsToTupR lhs) arguments
@@ -66,25 +64,20 @@ executeFun (Slam lhs (Sbody body)) = \arguments ->
 execute :: Gamma env -> UniformSchedule MetalKernel env -> Par ()
 execute env = \case
   Return -> pure ()
-
   Alet lhs binding next -> do
     value <- liftPar $ executeBinding env (lhsToTupR lhs) binding
     execute (push' env (lhs, value)) next
-
   Effect effect next -> do
     executeEffect env effect
     execute env next
-
   Acond (Var _ idx) yes no next -> do
     case prj' idx env of
       ValueScalar _ condition ->
         execute env (if condition == 1 then yes else no)
     execute env next
-
   Spawn l r -> do
     spawnPar (execute env l)
     execute env r
-
   _ ->
     unsupported "schedule loop execution is not implemented"
 

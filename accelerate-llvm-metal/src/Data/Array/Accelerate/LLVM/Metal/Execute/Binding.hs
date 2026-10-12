@@ -24,11 +24,15 @@ import Data.Array.Accelerate.Representation.Type
 import Data.Array.Accelerate.Type
 
 import Data.Array.Accelerate.LLVM.State (LLVM)
-import Data.Array.Accelerate.LLVM.Metal.Array.Prim (mallocBuffer)
+import Data.Array.Accelerate.LLVM.Metal.Array.Prim (mallocBuffer, copyToDevice)
 import Data.Array.Accelerate.LLVM.Metal.Execute.Environment
 import Data.Array.Accelerate.LLVM.Metal.Target (Metal, metalContext)
 import Formatting (string)
 import Data.Array.Accelerate.Error (internalError)
+import Data.Array.Accelerate.Array.Buffer (Buffer(..))
+import Control.Exception (onException)
+import Data.Array.Accelerate.LLVM.Metal.Array.Data (releaseBuffer)
+import Foreign
 
 executeBinding :: Gamma env -> BasesR t -> Binding env t -> LLVM Metal (Distribute Value t)
 executeBinding env baseTp = \case
@@ -61,7 +65,17 @@ executeBinding env baseTp = \case
           Refl -> pure value
       _ -> unsupported "expected a reference"
 
-  Use {} -> unsupported "host-to-device input transfer is not implemented"
+  Use tp n (Buffer hostPointer) -> do
+    let bytesInteger = toInteger n * toInteger (scalarTypeSize tp)
+    context <- asks metalContext
+    let bytes = fromInteger bytesInteger
+    deviceBuffer <- liftIO $ do
+      buffer <- mallocBuffer context bytes
+      withForeignPtr hostPointer $ \source ->
+        copyToDevice buffer bytes source
+        `onException` releaseBuffer buffer
+      pure buffer
+    pure (ValueBuffer tp deviceBuffer)
   Unit _ -> unsupported "scalar-to-buffer transfer is not implemented"
 
 expectScalarType :: BaseR t -> ScalarType t
