@@ -76,7 +76,17 @@ executeBinding env baseTp = \case
         `onException` releaseBuffer buffer
       pure buffer
     pure (ValueBuffer tp deviceBuffer)
-  Unit _ -> unsupported "scalar-to-buffer transfer is not implemented"
+  Unit var -> case prj' (varIdx var) env of
+    ValueScalar tp value
+      | ScalarDict <- scalarDict tp -> do
+        context <- asks metalContext
+        deviceBuffer <- liftIO $ do
+          with value $ \source -> do
+            buffer <- mallocBuffer context (scalarTypeSize tp)
+            copyToDevice buffer (scalarTypeSize tp) source `onException` releaseBuffer buffer
+            pure buffer
+        pure (ValueBuffer tp deviceBuffer)
+    _ -> unsupported "Buffer impossible"
 
 expectScalarType :: BaseR t -> ScalarType t
 expectScalarType (BaseRground (GroundRscalar tp)) = tp
