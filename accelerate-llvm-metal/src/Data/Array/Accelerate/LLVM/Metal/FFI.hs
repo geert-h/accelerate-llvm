@@ -15,6 +15,7 @@ module Data.Array.Accelerate.LLVM.Metal.FFI
   , bufferDestroy
   , bufferFinalizer
   , bufferRead
+  , bufferReadIndex
   , bufferContents
   , bufferGPUAddress
   , runKernel
@@ -75,6 +76,16 @@ foreign import ccall safe "acc_metal_buffer_read"
   bufferRead
     :: Ptr RawBuffer
     -> Ptr ()
+    -> CSize
+    -> CString
+    -> CSize
+    -> IO CInt
+
+foreign import ccall safe "acc_metal_buffer_read_index"
+  bufferReadIndex
+    :: Ptr RawBuffer
+    -> Ptr ()
+    -> CSize
     -> CSize
     -> CString
     -> CSize

@@ -24,7 +24,7 @@ import Data.Array.Accelerate.Representation.Type
 import Data.Array.Accelerate.Type
 
 import Data.Array.Accelerate.LLVM.State (LLVM)
-import Data.Array.Accelerate.LLVM.Metal.Array.Prim (mallocBuffer, copyToDevice)
+import Data.Array.Accelerate.LLVM.Metal.Array.Prim (mallocBuffer, copyToDevice, readFromDevice)
 import Data.Array.Accelerate.LLVM.Metal.Execute.Environment
 import Data.Array.Accelerate.LLVM.Metal.Target (Metal, metalContext)
 import Formatting (string)
@@ -89,13 +89,15 @@ shapeElements (ShapeRsnoc shr) (sh, ValueScalar _ n)
   | otherwise = shapeElements shr sh * toInteger n
 
 evalArrayInstr :: Gamma env -> EvalArrayInstr (LLVM Metal) (ArrayInstr env)
-evalArrayInstr env = EvalArrayInstr $ \instruction _ ->
-  case instruction of
-    Parameter (Var _ idx) ->
-      case prj' idx env of
+evalArrayInstr env = EvalArrayInstr $ \instr arg -> case instr of
+    Index (Var gtp bufferIdx) 
+      | GroundRbuffer tp   <- gtp
+      , ValueBuffer _ buffer <- prj' bufferIdx env ->
+          liftIO $ readFromDevice tp buffer arg
+      | otherwise -> unsupported "Buffer impossible"
+    Parameter (Var _ idx) -> case prj' idx env of
         ValueScalar _ value -> pure value
-        _ -> unsupported "expected a scalar parameter"
-    Index _ -> unsupported "host-side indexing of device is not implemented"
+        _ -> unsupported "Scalar impossible"
 
 unsupported :: String -> LLVM Metal a
 unsupported message =

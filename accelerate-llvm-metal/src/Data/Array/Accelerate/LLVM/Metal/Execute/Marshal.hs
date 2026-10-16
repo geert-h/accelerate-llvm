@@ -15,7 +15,7 @@ import Control.Concurrent.MVar (newMVar, readMVar)
 import Data.IORef (readIORef, writeIORef)
 import Foreign.ForeignPtr (withForeignPtr)
 
-import Data.Array.Accelerate.Array.Buffer (Buffer(..), newBuffer, unsafeFreezeBuffer)
+import Data.Array.Accelerate.Array.Buffer (Buffer(..), newBuffer, unsafeFreezeBuffer, memoryByteSize)
 import Data.Array.Accelerate.Representation.Elt (scalarTypeSize)
 import Data.Array.Accelerate.Representation.Ground (GroundR(..))
 import Data.Array.Accelerate.Representation.Type
@@ -34,7 +34,7 @@ import qualified Data.Array.Accelerate.LLVM.Metal.Array.Prim as Buffer
 import Data.Array.Accelerate.LLVM.Metal.Execute.Environment
 
 import Control.Monad (when)
-import Foreign.Ptr (Ptr, nullPtr)
+import Foreign.Ptr (Ptr, nullPtr, castPtr)
 import Foreign.Storable (pokeByteOff)
 
 import Data.Array.Accelerate.Error (internalError)
@@ -43,18 +43,33 @@ import Data.Array.Accelerate.Type
 
 import Data.Array.Accelerate.LLVM.Metal.Context (Context)
 import Data.Array.Accelerate.LLVM.Metal.FFI (RawBuffer)
-import Data.Array.Accelerate.LLVM.Metal.Array.Data (MetalBuffer(..), withBuffer)
+import Data.Array.Accelerate.LLVM.Metal.Array.Data (MetalBuffer(..), withBuffer, releaseBuffer)
+import Data.Array.Accelerate.LLVM.Metal.Array.Prim (mallocBuffer)
+import Control.Exception (onException)
 
-baseToValues :: BasesR t -> t -> IO (Distribute Value t)
-baseToValues TupRunit _ = pure ()
+baseToValues :: Context -> BasesR t -> t -> IO (Distribute Value t)
+baseToValues _ TupRunit _ = pure ()
 -- scalar input, wait for the host value and put it in an internal reference
-baseToValues (TupRpair (TupRsingle BaseRsignal) (TupRsingle (BaseRref (GroundRscalar tp)))) (Signal ready, Ref input) = do
+baseToValues _ (TupRpair (TupRsingle BaseRsignal) (TupRsingle (BaseRref (GroundRscalar tp)))) (Signal ready, Ref input) = do
   readMVar ready
   value <- readIORef input
   ref <- newMVar (ValueScalar tp value)
   pure (ValueSignal ready, ValueRef ref)
+baseToValues context (TupRpair (TupRsingle BaseRsignal) (TupRsingle (BaseRref (GroundRbuffer tp)))) (Signal ready, Ref input) = do
+  readMVar ready
+  Buffer hostPointer <- readIORef input
+  deviceBuffer <- withForeignPtr hostPointer $ \source -> do
+    byteSize <- memoryByteSize (castPtr source)
+    let bytes = fromIntegral byteSize
+
+    metalBuffer <- mallocBuffer context bytes
+    Buffer.copyToDevice metalBuffer bytes source `onException` releaseBuffer metalBuffer
+    pure metalBuffer
+  
+  ref <- newMVar (ValueBuffer tp deviceBuffer)
+  pure (ValueSignal ready, ValueRef ref)
 -- scalar output, writing the scheduled reference updates the host reference
-baseToValues (TupRpair (TupRsingle BaseRsignalResolver) (TupRsingle (BaseRrefWrite (GroundRscalar _)))) (SignalResolver ready, OutputRef output) =
+baseToValues _ (TupRpair (TupRsingle BaseRsignalResolver) (TupRsingle (BaseRrefWrite (GroundRscalar _)))) (SignalResolver ready, OutputRef output) =
   pure
     (ValueSignalResolver ready
     , ValueOutputRef $ \case
@@ -62,7 +77,7 @@ baseToValues (TupRpair (TupRsingle BaseRsignalResolver) (TupRsingle (BaseRrefWri
         _ -> fail "accelerate-llvm-metal: expected scalar output"
     )
 -- buffer output. allocate a proper Accelerate host buffer and copy into it
-baseToValues (TupRpair (TupRsingle BaseRsignalResolver) (TupRsingle (BaseRrefWrite (GroundRbuffer tp)))) (SignalResolver ready, OutputRef output) =
+baseToValues _ (TupRpair (TupRsingle BaseRsignalResolver) (TupRsingle (BaseRrefWrite (GroundRbuffer tp)))) (SignalResolver ready, OutputRef output) =
   pure
     (ValueSignalResolver ready
     , ValueOutputRef $ \case
@@ -81,11 +96,11 @@ baseToValues (TupRpair (TupRsingle BaseRsignalResolver) (TupRsingle (BaseRrefWri
         _ -> fail "accelerate-llvm-metal: expected buffer output"
     )
 -- match the signal/reference pairs above before this general tuple case
-baseToValues (TupRpair a b) (x, y) = do
-  x' <- baseToValues a x
-  y' <- baseToValues b y
+baseToValues ctx (TupRpair a b) (x, y) = do
+  x' <- baseToValues ctx a x
+  y' <- baseToValues ctx b y
   pure (x', y')
-baseToValues _ _ = fail "accelerate-llvm-metal: unsupported function argument"
+baseToValues _ _ _ = fail "Unexpected types in the input or output of an Acc function"
 
 data MarshalledKernel where
   MarshalledKernel ::  MetalKernel env -> Gamma env -> MarshalledKernel

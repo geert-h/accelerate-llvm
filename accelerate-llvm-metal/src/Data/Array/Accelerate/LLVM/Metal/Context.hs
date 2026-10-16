@@ -38,7 +38,5 @@ withContext :: Context -> (Ptr RawContext -> IO a) -> IO a
 withContext (Context handle) = withForeignPtr handle
 
 withNewContext :: (Context -> IO a) -> IO a
-withNewContext = bracket new release
-  where
-    release (Context handle) = finalizeForeignPtr handle
+withNewContext = bracket new (\(Context handle) -> finalizeForeignPtr handle)
 

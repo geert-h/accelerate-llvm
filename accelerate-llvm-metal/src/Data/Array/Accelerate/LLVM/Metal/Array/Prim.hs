@@ -4,6 +4,7 @@ module Data.Array.Accelerate.LLVM.Metal.Array.Prim
   ( mallocBuffer
   , withNewBuffer
   , copyToHost
+  , readFromDevice
   , copyToDevice
   , withBufferContents
   , withBufferGPUAddress
@@ -11,7 +12,6 @@ module Data.Array.Accelerate.LLVM.Metal.Array.Prim
 
 import Control.Exception (bracket, mask_, onException)
 import Control.Monad (when)
-import Data.Word (Word64)
 import Foreign.C.String (peekCString)
 import Foreign.ForeignPtr (newForeignPtr)
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
@@ -24,6 +24,8 @@ import Data.Array.Accelerate.LLVM.Metal.FFI
 import Formatting (string)
 import Data.Array.Accelerate.Error (internalError)
 import Foreign.Marshal.Utils (copyBytes)
+import Data.Array.Accelerate.Type
+import Data.Array.Accelerate.Representation.Elt (scalarTypeSize)
 
 mallocBuffer :: Context -> Int -> IO MetalBuffer
 mallocBuffer context bytes
@@ -51,6 +53,21 @@ copyToDevice buffer bytes source
     withBufferContents buffer $ \destination ->
       copyBytes destination (castPtr source) bytes
 
+readFromDevice :: ScalarType e -> MetalBuffer -> Int -> IO e
+readFromDevice tp buffer idx 
+  | ScalarDict <- scalarDict tp =
+    alloca $ \dest -> do
+      copyFromBufferIndexToDevice buffer (scalarTypeSize tp) idx dest
+      peek dest
+
+copyFromBufferIndexToDevice :: MetalBuffer -> Int -> Int -> Ptr a -> IO ()
+copyFromBufferIndexToDevice buffer bytes idx dest
+  | idx < 0 || idx > bufferBytes buffer = internalError "Index outside of bounds metal buffer on device"
+  | otherwise =
+    withBuffer buffer $ \ptr ->
+      allocaBytes 1024 $ \errorBuffer -> do
+        status <- bufferReadIndex ptr (castPtr dest) (fromIntegral bytes) (fromIntegral idx) errorBuffer 1024
+        when (status /= 0) $ do peekCString errorBuffer >>= internalError string
 
 -- GPU writes must have completed before calling this
 copyToHost :: MetalBuffer -> Int -> Ptr a -> IO ()

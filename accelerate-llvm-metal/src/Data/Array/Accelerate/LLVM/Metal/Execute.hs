@@ -42,6 +42,8 @@ import Data.Array.Accelerate.Error (internalError)
 import Formatting
 import qualified Data.Array.Accelerate.LLVM.Metal.Array.Prim as Buffer
 import Foreign.Marshal.Utils (fillBytes)
+import Control.Monad.Reader (asks)
+import Data.Array.Accelerate.LLVM.Metal.Target (Metal(metalContext))
 
 instance Execute UniformScheduleFun MetalKernel where
   data Linked UniformScheduleFun MetalKernel t =
@@ -58,7 +60,8 @@ executeFun (Slam lhs1 (Slam lhs2 function)) =
   curry (executeFun (Slam (LeftHandSidePair lhs1 lhs2) function))
 executeFun (Slam lhs (Sbody body)) = \arguments ->
   evalMetal defaultTarget $ evalPar $ do
-    values <- liftIO $ baseToValues (lhsToTupR lhs) arguments
+    context <- liftPar $ asks metalContext
+    values <- liftIO $ baseToValues context (lhsToTupR lhs) arguments
     execute (push' Empty (lhs, values)) body
 
 execute :: Gamma env -> UniformSchedule MetalKernel env -> Par ()

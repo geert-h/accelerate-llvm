@@ -69,12 +69,9 @@ void *acc_metal_pipeline_load(void *context_pointer, const char *path,
     }
 
     NSError *failure = nil;
-    printf("function: %s\n", function_name);
-    printf("before library\n");
     id<MTLLibrary> library =
         [context.device newLibraryWithURL:[NSURL fileURLWithPath:filename]
                                     error:&failure];
-    printf("after library\n");
     if (!library) {
       snprintf(error, error_size, "%s",
                failure.localizedDescription.UTF8String
@@ -89,11 +86,9 @@ void *acc_metal_pipeline_load(void *context_pointer, const char *path,
       return NULL;
     }
 
-    printf("before pipeline\n");
     id<MTLComputePipelineState> pipeline =
         [context.device newComputePipelineStateWithFunction:function
                                                       error:&failure];
-    printf("after pipeline\n");
 
     if (!pipeline) {
       snprintf(error, error_size, "%s",
@@ -102,7 +97,6 @@ void *acc_metal_pipeline_load(void *context_pointer, const char *path,
       return NULL;
     }
 
-    printf("returning from pipeline load\n");
     return (__bridge_retained void *)pipeline;
   }
 }
@@ -158,6 +152,27 @@ int acc_metal_buffer_read(void *buffer_pointer, void *output, size_t bytes,
     }
 
     memcpy(output, buffer.contents, bytes);
+    return 0;
+  }
+}
+
+int acc_metal_buffer_read_index(void *buffer_pointer, void *output,
+                                size_t bytes, size_t index, char *error,
+                                size_t error_size) {
+  if (bytes == 0)
+    return 0;
+
+  @autoreleasepool {
+    id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)buffer_pointer;
+
+    if (!buffer || !output || bytes > buffer.length || !buffer.contents) {
+      snprintf(error, error_size, "Invalid Metal buffer read");
+      return 1;
+    }
+
+    const uint8_t *data = (const uint8_t *)buffer.contents;
+
+    memcpy(output, data + index * bytes, bytes);
     return 0;
   }
 }
