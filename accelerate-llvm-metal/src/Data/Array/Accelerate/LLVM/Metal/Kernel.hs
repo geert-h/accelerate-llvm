@@ -20,7 +20,7 @@ import Data.Array.Accelerate.AST.Idx (Idx)
 import Data.Array.Accelerate.AST.Kernel (IsKernel(..), KernelArgR(..), OpenKernelFun(..))
 import Data.Array.Accelerate.Backend (NFData'(..))
 import Data.Array.Accelerate.Error (internalError)
-import Data.Array.Accelerate.Type (ScalarType(..), SingleDict(..), singleDict)
+import Data.Array.Accelerate.Type
 import Data.Array.Accelerate.LLVM.CodeGen.Environment (sizeOfEnv)
 
 import Data.Array.Accelerate.LLVM.Metal.CodeGen (MetalCode(..), codegen)
@@ -29,7 +29,6 @@ import Data.Array.Accelerate.LLVM.Metal.State (evalMetal, defaultTarget)
 import Data.Array.Accelerate.LLVM.Compile.Cache (UID)
 import Data.Array.Accelerate.LLVM.Metal.Operation (MetalOp (..))
 import Foreign.Ptr (Ptr)
-import Data.Word (Word64)
 import Foreign.Storable (alignment, sizeOf)
 import Data.Array.Accelerate.AST.Schedule (generateKernelNameAndDescription)
 import Data.Array.Accelerate.AST.Exp
@@ -70,7 +69,9 @@ kernelArgLayout (KernelArgRbuffer _ _)
     addressLayout = (alignment (undefined :: Word64), sizeOf (undefined :: Word64))
 kernelArgLayout (KernelArgRscalar (SingleScalarType tp))
   | SingleDict <- singleDict tp = (alignment (undefined :: r), sizeOf (undefined :: r))
-kernelArgLayout (KernelArgRscalar (VectorScalarType _)) = internalError "Metal vector-valued kernel arguments not implemented"
+kernelArgLayout (KernelArgRscalar tp)
+  | ScalarDict <- scalarDict tp =
+    (alignment (undefined :: r), sizeOf (undefined :: r)) 
 
 kernelArgumentsAlignment :: OpenKernelFun MetalKernel env f -> Int
 kernelArgumentsAlignment (KernelFunBody _) = 1

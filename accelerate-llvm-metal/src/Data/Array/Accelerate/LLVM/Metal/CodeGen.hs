@@ -160,14 +160,15 @@ bindMetalEnvFromStruct e =
           , Int -- Next fresh buffer variable index
           )
     go _ Empty = (return (), Empty, 0, 0)
-    go toTupleIdx (Push env (AccessGroundRscalar tp@(SingleScalarType t)))
-      | Refl <- marshalScalarArg tp
-      , Refl <- singleTypeBufferEltR t =
+    go toTupleIdx (Push env (AccessGroundRscalar tp))
+      | Refl <- marshalScalarArg tp = 
         ( do
             cg
             instr_ $ downcast $
               namePtr := GetElementPtr (gepStruct (bufferEltR tp) operandEnv $ toTupleIdx $ TupleIdxRight TupleIdxSelf)
-            instr_ $ downcast $ name := Load NonVolatile operandPtr Nothing
+            let (operandPtr', align) = ptrAsUnalignedVecPtr tp operandPtr
+            instr_ $ downcast $
+              name := Load NonVolatile operandPtr' align
         , gamma `Push` GroundOperandParam operand
         , sclrcnt + 1
         , bfrcnt
@@ -178,9 +179,6 @@ bindMetalEnvFromStruct e =
         operandPtr = LocalReference (PrimType $ PtrPrimType (bufferEltR tp) (AddrSpace 2)) namePtr
         name = fromString $ "param." ++ show sclrcnt
         namePtr = fromString $ "param." ++ show sclrcnt ++ ".ptr"
-
-    go _ (Push _ (AccessGroundRscalar (VectorScalarType _))) =
-       internalError "Metal vector-valued scalar arguments are not implemented"
 
     go toTupleIdx (Push env (AccessGroundRbuffer m (tp :: ScalarType t))) =
       ( do
@@ -274,49 +272,58 @@ descEnvTypes env envTp = do
 
 buildInnerArgBuff :: Env AccessGroundR env -> CodeGen Metal MetadataNodeID
 buildInnerArgBuff env = do
-  (_, _, fields) <- buildEnvDesc env
+  (_, _, _, fields) <- buildEnvDesc env
   addMetadata $ const $ map Just fields
 
-buildEnvDesc :: Env AccessGroundR env -> CodeGen Metal (Int, Int, [Metadata])
-buildEnvDesc Empty = pure (0, 0, [])
+metalStorageElementLayout :: ScalarType t -> (Int, Int)
+metalStorageElementLayout (VectorScalarType (VectorType _ s)) = primSizeAlignment (bufferEltR (SingleScalarType s))
+metalStorageElementLayout t = primSizeAlignment (bufferEltR t)
+
+buildEnvDesc :: Env AccessGroundR env -> CodeGen Metal (Int, Int, Int, [Metadata])
+buildEnvDesc Empty = pure (0, 0, 0, [])
 buildEnvDesc (Push env arg@(AccessGroundRscalar t)) = do
-  (n, cursor, r) <- buildEnvDesc env
+  (n, locIdx, cursor, r) <- buildEnvDesc env
   let (sz, al) = primSizeAlignment (metalFieldType arg)
+      (elementSz, _) = metalStorageElementLayout t
       offset   = makeAligned cursor al
+      arrayLength = case t of
+        (VectorScalarType (VectorType l _)) -> l
+        _ -> 0 :: Int
+      locIdx' = if arrayLength == 0 then locIdx + 1 else locIdx + arrayLength
 
   d <- addMetadata $ const $ map Just
     [ MetadataConstantOperand $ ScalarConstant scalarTypeInt32 $ fromIntegral n
     , MetadataStringOperand "air.indirect_constant"
     , MetadataStringOperand "air.location_index"
-    , MetadataConstantOperand $ ScalarConstant scalarTypeInt32 $ fromIntegral n
+    , MetadataConstantOperand $ ScalarConstant scalarTypeInt32 $ fromIntegral locIdx
     , MetadataConstantOperand $ ScalarConstant scalarTypeInt32 1
     , MetadataStringOperand "air.arg_type_name"
     , MetadataStringOperand $ SBS.pack $ metalTypeName t
     , MetadataStringOperand "air.arg_name"
     , MetadataStringOperand $ SBS.pack $ "field" ++ show n
     ]
-  pure (n + 1, offset + sz,
+  pure (n + 1, locIdx', offset + sz,
     r ++
     [ MetadataConstantOperand $ ScalarConstant scalarTypeInt32 $ fromIntegral offset
-    , MetadataConstantOperand $ ScalarConstant scalarTypeInt32 $ fromIntegral sz
-    , MetadataConstantOperand $ ScalarConstant scalarTypeInt32 0
+    , MetadataConstantOperand $ ScalarConstant scalarTypeInt32 $ fromIntegral elementSz
+    , MetadataConstantOperand $ ScalarConstant scalarTypeInt32 $ fromIntegral arrayLength
     , MetadataStringOperand $ SBS.pack $ metalTypeName t
     , MetadataStringOperand $ SBS.pack $ "field" ++ show n
     , MetadataStringOperand "air.indirect_argument"
     , MetadataNodeOperand $ MetadataNodeReference d
     ])
 buildEnvDesc (Push env arg@(AccessGroundRbuffer m t)) = do
-  (n, cursor, r) <- buildEnvDesc env
+  (n, locIdx, cursor, r) <- buildEnvDesc env
 
   let (sz, al)   = primSizeAlignment (metalFieldType arg)
       offset     = makeAligned cursor al
-      (sz', al') = primSizeAlignment (bufferEltR t)
+      (sz', al') = metalStorageElementLayout t
 
   d <- addMetadata $ const $ map Just
     [ MetadataConstantOperand $ ScalarConstant scalarTypeInt32 $ fromIntegral n
     , MetadataStringOperand "air.buffer"
     , MetadataStringOperand "air.location_index"
-    , MetadataConstantOperand $ ScalarConstant scalarTypeInt32 $ fromIntegral n
+    , MetadataConstantOperand $ ScalarConstant scalarTypeInt32 $ fromIntegral locIdx
     , MetadataConstantOperand $ ScalarConstant scalarTypeInt32 1
     , MetadataStringOperand $
         case m of
@@ -334,7 +341,7 @@ buildEnvDesc (Push env arg@(AccessGroundRbuffer m t)) = do
     , MetadataStringOperand "air.arg_name"
     , MetadataStringOperand $ SBS.pack $ "field" ++ show n
     ]
-  pure (n + 1, offset + sz,
+  pure (n + 1, locIdx + 1, offset + sz,
     r ++
     [ MetadataConstantOperand $ ScalarConstant scalarTypeInt32 $ fromIntegral offset
     , MetadataConstantOperand $ ScalarConstant scalarTypeInt32 $ fromIntegral sz
@@ -392,4 +399,5 @@ metalTypeName (SingleScalarType (NumSingleType (FloatingNumType t))) = case t of
   TypeHalf   -> "half"
   TypeFloat  -> "float"
   TypeDouble -> internalError "Double not supported on Metal"
-metalTypeName (VectorScalarType _) = internalError "vector argument metadata is not implemented for Metal"
+metalTypeName (VectorScalarType (VectorType _ t)) = metalTypeName (SingleScalarType t)
+

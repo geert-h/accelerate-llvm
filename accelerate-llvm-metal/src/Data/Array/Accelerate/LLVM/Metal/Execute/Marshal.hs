@@ -39,7 +39,7 @@ import Foreign.Storable (pokeByteOff)
 
 import Data.Array.Accelerate.Error (internalError)
 import Data.Array.Accelerate.Type
-  ( ScalarType(..), SingleDict(..), singleDict )
+  ( ScalarDict (..), scalarDict )
 
 import Data.Array.Accelerate.LLVM.Metal.Context (Context)
 import Data.Array.Accelerate.LLVM.Metal.FFI (RawBuffer)
@@ -154,17 +154,14 @@ withKernelArguments context metadata outer function actuals action =
         action arguments (reverse resources)
       -- Match scalar declaration with an argument
       -- retain arg but also check the type
-      go cursor resources (KernelFunLam arg@(KernelArgRscalar tp) rest) (SArgScalar (Var _ idx) :>: args) arguments contents =
-        case tp of
-          SingleScalarType single
-            | SingleDict <- singleDict single ->
-                case prj' idx outer of
-                  ValueScalar _ value -> do                        -- look up the scalar value
-                    (offset, next) <- place cursor arg             -- calculate how it should be aligned
-                    pokeByteOff contents offset value              -- write value into arg buffer
-                    go next resources rest args arguments contents -- go to next args
-                  _ -> internalError "Expected a scalar kernel argument"
-          VectorScalarType _ -> internalError "Metal vector-valued arguments are not supported"
+      go cursor resources (KernelFunLam arg@(KernelArgRscalar tp) rest) (SArgScalar (Var _ idx) :>: args) arguments contents
+        | ScalarDict <- scalarDict tp =
+            case prj' idx outer of
+              ValueScalar _ value -> do                        -- look up the value
+                (offset, next) <- place cursor arg             -- calculate how it should be aligned
+                pokeByteOff contents offset value              -- write value into arg buffer
+                go next resources rest args arguments contents -- go to next args
+              _ -> internalError "Expected a scalar kernel argument"
       -- Packs buffer arguments
       -- empty buffers have no Metal allocation
       go cursor resources (KernelFunLam arg@(KernelArgRbuffer _ _) rest) (SArgBuffer _ (Var _ idx) :>: args) arguments contents =
