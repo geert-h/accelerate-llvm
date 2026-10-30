@@ -366,9 +366,8 @@ opCodeGen flatOp@(FlatOp op args idxArgs) = case op of
   MetalScan' dir -> defaultCodeGenScan' dir flatOp args idxArgs
   MetalScan dir -> defaultCodeGenScan dir flatOp args idxArgs
   -- TODO: Similar to Native, we should use one global array of locks, instead of an array per permute
-  MetalPermute
-    | (_ :>: output :>: _ :>: _) <- args ->
-      defaultCodeGenPermute (\envs j _ -> atomically envs output $ OP_Int j) args idxArgs
+  MetalPermute ->
+      defaultCodeGenPermute lockArraySize atomically args idxArgs
   -- Copied from PTX opCodeGen
   -- MetalPermute
   --   | combineFun :>: output :>: locks :>: source :>: _ <- args

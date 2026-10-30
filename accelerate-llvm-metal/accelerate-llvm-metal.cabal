@@ -1,4 +1,4 @@
-cabal-version:      2.2
+cabal-version:      3.0
 name:               accelerate-llvm-metal
 version:            1.4.0.0
 -- synopsis: description:
@@ -84,6 +84,7 @@ test-suite nofib-llvm-metal
   build-depends:
           base                          >= 4.10
         , accelerate
+        , accelerate:nofib
         , accelerate-llvm-metal
         , tasty
         , tasty-hunit

@@ -2,14 +2,12 @@
 {-# LANGUAGE OverloadedStrings   #-}
 module Data.Array.Accelerate.LLVM.Metal.CodeGen.Permute
   ( atomically
+  , lockArraySize
   ) where
 
-import Data.Array.Accelerate.LLVM.CodeGen.Environment
 import Data.Array.Accelerate.LLVM.CodeGen.IR
 import Data.Array.Accelerate.LLVM.Metal.Target (Metal)
 import Data.Array.Accelerate.LLVM.CodeGen.Monad
-import Data.Array.Accelerate.AST.Operation hiding (Body, Lam)
-import Data.Array.Accelerate.LLVM.CodeGen.Array (firstArrayPtr)
 import qualified Data.Array.Accelerate.LLVM.CodeGen.Arithmetic as A
 import Data.Array.Accelerate.Type
 import LLVM.AST.Type.Operand (Operand(LocalReference))
@@ -39,18 +37,11 @@ lockArraySize = 16 * 1024 * 8
 --       done = true
 -- 
 -- This is repeated until all threads in the SIMD group are done
-atomically :: Envs env idxEnv
-  -> Arg env (Mut sh e)
-  -> Operands Int
+atomically
+  :: Operands Word64
   -> CodeGen Metal ()
   -> CodeGen Metal ()
-atomically envs mutArray i action = do
-  seed <- firstArrayPtr envs mutArray
-  i'   <- A.add numType seed i
-  i''  <- A.fromIntegral TypeInt (IntegralNumType TypeWord64) i'
-  h    <- A.hash i''
-  idx  <- A.rem TypeWord64 h $ A.liftWord64 $ Prelude.fromIntegral lockArraySize
-
+atomically idx action = do
   loop    <- newBlock "spinlock.loop"
   attempt <- newBlock "spinlock.attempt"
   crit    <- newBlock "spinlock.critical"

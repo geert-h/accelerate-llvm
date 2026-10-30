@@ -38,6 +38,13 @@ metalDataLayout = case LLVM.parseDataLayout metalDataLayoutString of
 instance Intrinsic Metal where
   intrinsicForTarget = llvmMetalIntrinsic
 
+  -- The language specs (section 2.6) states the following:
+  -- Metal supports atomic<T>, where T can be int, int32_t, uint, uint32_t, bool, or
+  -- ulong for all OSes that support Metal 2.4 and later, or T can be float for all OSes that
+  -- support Metal 3 and later.
+  -- So choosing 4 here doesn't cover all of the cases (namely ulong and bool)
+  supportsAtomicCAS size = pure $ size == 4
+
 -- TODO: These operations are incomplete
 -- Not only the operations are (probably incomplete),
 -- but also all the operations should be added for the different types apart from float.

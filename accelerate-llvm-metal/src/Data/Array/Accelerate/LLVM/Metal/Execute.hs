@@ -24,7 +24,7 @@ import Data.Array.Accelerate.AST.LeftHandSide
   ( LeftHandSide(..), lhsToTupR )
 import Data.Array.Accelerate.AST.Schedule (IOFun)
 import Data.Array.Accelerate.AST.Schedule.Uniform
-  ( UniformScheduleFun(..), UniformSchedule(..), Effect(..) )
+  ( UniformScheduleFun(..), UniformSchedule, Effect(..), UniformSchedule' (..) )
 import Data.Array.Accelerate.AST.Var (Var(..))
 
 import Data.Array.Accelerate.LLVM.Metal.Array.Data (MetalBuffer(..), withBuffer)
@@ -78,7 +78,7 @@ execute env = \case
       ValueScalar _ condition ->
         execute env (if condition == 1 then yes else no)
     execute env next
-  Spawn l r -> do
+  Spawn SplitDefault l r -> do
     spawnPar (execute env l)
     execute env r
   _ ->
