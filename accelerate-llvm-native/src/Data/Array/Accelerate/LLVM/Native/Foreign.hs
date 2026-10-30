@@ -1,9 +1,5 @@
-{-# LANGUAGE DeriveDataTypeable  #-}
-{-# LANGUAGE GADTs               #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE StandaloneDeriving  #-}
-{-# LANGUAGE TypeApplications    #-}
-{-# OPTIONS_GHC -fno-warn-orphans #-}
+{-# LANGUAGE CPP #-}
+{-# OPTIONS_GHC -Wno-orphans #-}
 -- |
 -- Module      : Data.Array.Accelerate.LLVM.Native.Foreign
 -- Copyright   : [2016..2020] The Accelerate Team
@@ -78,6 +74,7 @@ data ForeignExp f where
              -> IRFun1 Native (x -> y)
              -> ForeignExp (x -> y)
 
+#if __GLASGOW_HASKELL__ < 912
 deriving instance Typeable ForeignAcc
 deriving instance Typeable ForeignExp
-
+#endif

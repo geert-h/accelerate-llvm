@@ -1,20 +1,5 @@
-{-# OPTIONS_GHC -fno-warn-orphans #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE GADTs             #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE InstanceSigs #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE PatternSynonyms #-}
-{-# LANGUAGE RankNTypes #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE StandaloneDeriving #-}
-{-# LANGUAGE TypeApplications #-}
-{-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE TypeOperators #-}
+{-# LANGUAGE TypeFamilies         #-}
 {-# LANGUAGE UndecidableInstances #-}
-{-# LANGUAGE ViewPatterns #-}
 {-# OPTIONS_GHC -Wno-name-shadowing #-}
 
 module Data.Array.Accelerate.LLVM.Native.Link.Schedule (
@@ -77,7 +62,6 @@ import qualified Data.ByteString.Char8 as Char8
 import Foreign.Ptr
 import Foreign.Storable
 import System.IO.Unsafe ( unsafePerformIO )
-import Data.ByteString.Builder.Extra (flush)
 import Data.ByteString.Short ( fromShort )
 import Numeric ( readHex )
 
@@ -432,8 +416,8 @@ convert _ Return =
     maySuspend = False,
     phase2 = \_ _ _ _ _ _ _ -> returnNull
   }
--- convert inAwhile (Spawn (Effect (SignalAwait signals) a) b)
-convert inAwhile (Spawn a b)
+-- convert inAwhile (Spawn SplitDefault (Effect (SignalAwait signals) a) b)
+convert inAwhile (Spawn SplitDefault a b)
   | Exists2 a1 <- convert inAwhile a
   , Exists2 b1 <- convert inAwhile b =
   Exists2 $ Phase1{
@@ -1509,6 +1493,7 @@ pushTwoSame (LeftHandSideSingle t1 `LeftHandSidePair` LeftHandSideWildcard _) st
   )
 pushTwoSame _ _ _ _ = internalError "Nested pair not allowed"
 
+{- TODO WALL: DEAD CODE
 -- Representation of a BaseR when stored in registers
 toPrimType :: BaseR t -> PrimType (ReprBaseR t)
 toPrimType (BaseRground (GroundRscalar tp))
@@ -1518,6 +1503,7 @@ toPrimType BaseRsignal = primType
 toPrimType BaseRsignalResolver = primType
 toPrimType (BaseRref tp) = toPrimType $ BaseRground tp
 toPrimType (BaseRrefWrite tp) = toPrimType $ BaseRground tp
+-}
 
 -- Representation of a BaseR when stored in a struct
 toStoragePrimType :: BaseR t -> PrimType (StorageBaseR t)
@@ -2007,7 +1993,9 @@ putArrayDescriptor structVars localVars (ArrayDescriptor shr sh buffer) = do
       printString "]\n"
     ShapeRsnoc ShapeRz -> do
       printString "(Z :. "
-      putInt $ head sizes
+      putInt $ case sizes of
+        s:_ -> s
+        []  -> error "TODO WALL: NON-EXHAUSTIVE PATTERN MATCH"
       printString ") ["
 
       A.when (A.neq singleType sz (A.liftInt 0)) $ do

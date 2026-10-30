@@ -82,13 +82,13 @@ loopSelfScheduled counter size doWork = do
     return ()
   __syncthreads
 
-  index <- instr' $ Load Volatile index Nothing
+  index'' <- instr' $ Load Volatile index Nothing
 
-  condition <- lt singleType (OP_Word64 index) (OP_Word64 size)
+  condition <- lt singleType (OP_Word64 index'') (OP_Word64 size)
   _ <- cbr condition work exit
 
   _ <- setBlock work
-  doWork index
+  doWork index''
   _ <- br claim
 
   _ <- setBlock exit
@@ -141,7 +141,6 @@ loopInThreadblock descending peel perThread lower upper isFull groupCount active
 
     Loop.loopWith ann descending (OP_Int $ integral TypeInt 0) (OP_Int $ integral TypeInt perThread) $ \(OP_Bool isFirstForThread) idxForThread -> do
       __syncwarp
-      -- TODO: Decide whether the indices within the warp should be reversed as well, for descending loops
       OP_Int globalIdx <- A.mul numType idxForThread warpSz >>= A.add numType laneIdx >>= A.add numType startIdx
       body isFirstForThread Nothing (op TypeInt idxForThread) globalIdx
 
@@ -177,7 +176,6 @@ loopInThreadblock descending peel perThread lower upper isFull groupCount active
 
       Loop.loopWith ann descending (OP_Int $ integral TypeInt 0) warpGroupCount $ \(OP_Bool isFirstForThread) idxForThread -> do
         __syncwarp
-        -- TODO: What do we do for descending loops?
         warpFirst <- A.mul numType idxForThread warpSz >>= A.add numType startIdx
         OP_Int globalIdx <- A.add numType warpFirst laneIdx
         -- Compute the number of threads active in this warp

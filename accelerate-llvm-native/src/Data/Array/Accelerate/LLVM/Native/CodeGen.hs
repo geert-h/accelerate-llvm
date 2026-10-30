@@ -1,21 +1,4 @@
-{-# OPTIONS_GHC -fno-warn-orphans #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE GADTs             #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE InstanceSigs #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE PatternSynonyms #-}
-{-# LANGUAGE RankNTypes #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE StandaloneDeriving #-}
-{-# LANGUAGE TupleSections #-}
-{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE TypeOperators #-}
-{-# LANGUAGE UndecidableInstances #-}
-{-# LANGUAGE ViewPatterns #-}
 {-# OPTIONS_GHC -Wno-name-shadowing #-}
 
 -- |
@@ -33,12 +16,9 @@ module Data.Array.Accelerate.LLVM.Native.CodeGen
   where
 
 -- accelerate
-import Data.Array.Accelerate.Representation.Array
 import Data.Array.Accelerate.Representation.Shape (shapeRFromRank, shapeType, rank)
 import Data.Array.Accelerate.Representation.Type
-import Data.Array.Accelerate.AST.Exp
 import Data.Array.Accelerate.AST.Partitioned as P hiding (combine)
-import Data.Array.Accelerate.Analysis.Exp
 import Data.Array.Accelerate.Type
 import Data.Array.Accelerate.Error
 import qualified Data.Array.Accelerate.AST.Environment as Env
@@ -58,16 +38,14 @@ import Data.Bits
 import LLVM.AST.Type.Module
 import LLVM.AST.Type.Representation
 import LLVM.AST.Type.Instruction as LLVM
-import LLVM.AST.Type.Instruction.Volatile
 import LLVM.AST.Type.Instruction.Atomic
-import LLVM.AST.Type.Instruction.RMW
 import Data.Array.Accelerate.LLVM.CodeGen.Monad
 import qualified LLVM.AST.Type.Function as LLVM
 import Data.Array.Accelerate.LLVM.CodeGen.Array
 import Data.Array.Accelerate.LLVM.CodeGen.Sugar
 import Data.Array.Accelerate.LLVM.CodeGen.Exp
 import qualified Data.Array.Accelerate.LLVM.CodeGen.Arithmetic as A
-import Data.Array.Accelerate.LLVM.Native.CodeGen.Permute (atomically)
+import Data.Array.Accelerate.LLVM.Native.CodeGen.Permute (atomically, lockArraySize)
 import Data.Array.Accelerate.AST.LeftHandSide (Exists (Exists))
 import Control.Monad
 import qualified Data.Array.Accelerate.LLVM.CodeGen.Loop as Loop
@@ -97,7 +75,9 @@ codegen name env cluster args
     finishBlock <- newBlock "finish" -- Finish function from the work assisting paper
     workBlock <- newBlock "work"
     _ <- switch (OP_Word32 threadIndex) workBlock [(0xFFFFFFFF, initBlock), (0xFFFFFFFE, finishBlock)]
+    {- TODO WALL: DEAD CODE
     let hasPermute = hasNPermute flat
+    -}
 
     if parallelDepth == 0 && rank shr /= 0 then do
       let (envs, loops) = initEnv gamma shr idxLHS sizes dirs localR localLHS
@@ -122,8 +102,14 @@ codegen name env cluster args
                 else
                   1024 * 16 -- TODO: Implement a better heuristic to choose the tile size
 
+          -- Number of tiles
+          sizeAdd <- A.add numType size (A.liftInt $ tileSize - 1)
+          OP_Int tileCount' <- A.quot TypeInt sizeAdd (A.liftInt tileSize)
+          tileCount <- instr' $ BitCast scalarType tileCount'
+
           let envs' = envs{
             envsLoopDepth = 0,
+            envsTileSizeCount = [(A.liftInt tileSize, OP_Int tileCount')],
             envsDescending = isDescending direction
           }
 
@@ -134,10 +120,6 @@ codegen name env cluster args
 
           setBlock initBlock
           do
-            -- Number of tiles
-            sizeAdd <- A.add numType size (A.liftInt $ tileSize - 1)
-            OP_Int tileCount' <- A.quot TypeInt sizeAdd (A.liftInt tileSize)
-
             -- Initialize kernel memory
             parCodeGenInitMemory kernelMem envs' TupleIdxSelf parCodes
             -- Decide whether tileCount is large enough
@@ -162,10 +144,6 @@ codegen name env cluster args
             retval_ $ scalar (scalarType @Word8) 0
 
           setBlock workBlock
-          -- Number of tiles
-          sizeAdd <- A.add numType size (A.liftInt $ tileSize - 1)
-          OP_Int tileCount' <- A.quot TypeInt sizeAdd (A.liftInt tileSize)
-          tileCount <- instr' $ BitCast scalarType tileCount'
 
           -- Emit code to initialize a thread, and get the codes for the tile loops
           tileLoops <- genParallel kernelMem envs' TupleIdxSelf parCodes
@@ -319,6 +297,10 @@ codegen name env cluster args
             -- else [Loop.LoopVectorize]
       workassistChunked ann parallelShr workassistIndex workPerThread 1024 threadIndex threadCount tileSize parSizes $ \idx -> do
         let envs' = envs{
+            -- Tile size and count are currently only needed when parallelizing
+            -- collective operations; not when parallelizing over independent
+            -- dimensions.
+            envsTileSizeCount = internalError "Tile size and count are not available when parallelizing over independent dimensions.",
             envsLoopDepth = parallelDepth,
             envsIdx =
               foldr (\(o, i) -> Env.partialUpdate o i) (envsIdx envs)
@@ -333,10 +315,6 @@ codegen name env cluster args
   where
     (argTp, extractEnv, workassistIndex, workPerThread, threadIndex {- or flag -}, threadCount, kernelMem', gamma) = bindHeaderEnv env
 
-    isDescending :: LoopDirection Int -> Bool
-    isDescending LoopDescending = True
-    isDescending _ = False
-
 linkage :: Maybe LP.Linkage
 linkage = Just LP.DLLExport
 
@@ -345,9 +323,7 @@ opCodeGen flatOp@(FlatOp op args idxArgs) = case op of
   NGenerate -> defaultCodeGenGenerate args idxArgs
   NMap -> defaultCodeGenMap args idxArgs
   NBackpermute -> defaultCodeGenBackpermute args idxArgs
-  NPermute
-    | (_ :>: output :>: _ :>: _) <- args ->
-      defaultCodeGenPermute (\envs j _ -> atomically envs output $ OP_Int j) args idxArgs
+  NPermute -> defaultCodeGenPermute lockArraySize atomically args idxArgs
   NPermute' -> defaultCodeGenPermuteUnique args idxArgs
   NFold -> defaultCodeGenFold flatOp args idxArgs
   NFold1 -> defaultCodeGenFold1 flatOp args idxArgs
@@ -360,123 +336,24 @@ type NParLoopCodeGen = ParLoopCodeGen Native CPULoopAnalysis
 -- Parallel code generation for one-dimensional collective operations (folds and scans).
 -- Other operations, either OpCodeGenSingle or nested deeper, are handled in opCodeGen
 parCodeGen :: Bool -> FlatOp NativeOp env idxEnv -> Maybe (Exists (NParLoopCodeGen env idxEnv))
-parCodeGen descending (FlatOp NFold
-    (ArgFun fun :>: ArgExp seed :>: input :>: output :>: _)
-    (_ :>: _ :>: IdxArgIdx _ inputIdx :>: IdxArgIdx _ outputIdx :>: _))
-  = Just $ parCodeGenFold descending fun (Just seed) input output inputIdx outputIdx
-parCodeGen descending (FlatOp NFold1
-    (ArgFun fun :>: input :>: output :>: _)
-    (_ :>: IdxArgIdx _ inputIdx :>: IdxArgIdx _ outputIdx :>: _))
-  = Just $ parCodeGenFold descending fun Nothing input output inputIdx outputIdx
-parCodeGen descending (FlatOp (NScan1 _)
-    (ArgFun fun :>: input :>: output :>: _)
-    (_ :>: IdxArgIdx _ inputIdx :>: IdxArgIdx _ outputIdx :>: _))
-  = Just $ parCodeGenScan descending IsScan fun Nothing input inputIdx
-    (\_ _ -> return ())
-    (\_ _ -> return ())
-    (\envs result -> writeArray' envs output outputIdx result)
-    (\_ _ -> return ())
-parCodeGen descending (FlatOp (NScan' _)
-    (ArgFun fun :>: ArgExp seed :>: input :>: output :>: foldOutput :>: _)
-    (_ :>: _ :>: IdxArgIdx _ inputIdx :>: IdxArgIdx _ outputIdx :>: IdxArgIdx _ foldOutputIdx :>: _))
-  = Just $ parCodeGenScan descending IsScan fun (Just seed) input inputIdx
-    (\_ _ -> return ())
-    (\envs result -> writeArray' envs output outputIdx result)
-    (\_ _ -> return ())
-    (\envs result -> writeArray' envs foldOutput foldOutputIdx result)
-parCodeGen descending (FlatOp (NScan dir)
-    (ArgFun fun :>: ArgExp seed :>: input :>: output :>: _)
-    (_ :>: _ :>: IdxArgIdx _ inputIdx :>: _ :>: _))
-  = case dir of
-      LeftToRight -> Just $ parCodeGenScan descending IsScan fun (Just seed) input inputIdx
-        (\_ _ -> return ())
-        (\envs result -> writeArray' envs output inputIdx result)
-        (\_ _ -> return ())
-        (\envs result -> do
-          let n' = envsPrjParameter (Var scalarTypeInt $ varIdx n) envs
-          writeArrayAt' envs output rowIdx n' result
-        )
-      RightToLeft -> Just $ parCodeGenScan descending IsScan fun (Just seed) input inputIdx
-        (\envs result -> do
-          let n' = envsPrjParameter (Var scalarTypeInt $ varIdx n) envs
-          writeArrayAt' envs output rowIdx n' result
-        )
-        (\_ _ -> return ())
-        (\envs result -> writeArray' envs output inputIdx result)
-        (\_ _ -> return ())
-  where
-    ArgArray _ _ inputSh _ = input
-    n = case inputSh of
-      TupRpair _ (TupRsingle n') -> n'
-      _ -> internalError "Shape impossible"
-    rowIdx = case inputIdx of
-      TupRpair i _ -> i
-      _ -> internalError "Shape impossible"
-parCodeGen _ _ = Nothing
+parCodeGen descending (FlatOp op' args idxArgs) = case op' of
+  NScan1 _ -> defaultParCodeGenScan1 scanCode descending args idxArgs
+  NScan' _ -> defaultParCodeGenScan' scanCode descending args idxArgs
+  NScan _ -> defaultParCodeGenScan scanCode descending args idxArgs
+  NFold -> defaultParCodeGenFold scanCode descending args idxArgs
+  NFold1 -> defaultParCodeGenFold1 scanCode descending args idxArgs
+  _ -> Nothing
 
-parCodeGenFold
-  :: Bool
-  -> Fun env (e -> e -> e)
-  -> Maybe (Exp env e)
-  -> Arg env (In (sh, Int) e)
-  -> Arg env (Out sh e)
-  -> ExpVars idxEnv (sh, Int)
-  -> ExpVars idxEnv sh
-  -> Exists (NParLoopCodeGen env idxEnv)
-parCodeGenFold descending fun Nothing input output inputIdx outputIdx
-  | Just identity <- if descending then findRightIdentity fun else findLeftIdentity fun
-  = parCodeGenFold descending fun (Just $ mkConstant tp identity) input output inputIdx outputIdx
-  where
-    ArgArray _ (ArrayR _ tp) _ _ = output
--- Specialized version for commutative folds with identity
-parCodeGenFold descending fun seed input output inputIdx outputIdx
-  | isCommutative fun
-  , Just s <- seed
-  , Just i <- identity
-  = parCodeGenFoldCommutative descending fun s i input output inputIdx outputIdx
-  | otherwise
-  = parCodeGenScan descending IsFold fun seed input inputIdx
-    (\_ _ -> return ())
-    (\_ _ -> return ())
-    (\_ _ -> return ())
-    (\envs result -> writeArray' envs output outputIdx result)
-  where
-    ArgArray _ (ArrayR _ tp) _ _ = output
-    identity
-      | Just s <- seed
-      , if descending then isRightIdentity fun s else isLeftIdentity fun s
-      = Just s
-      | Just v <- if descending then findRightIdentity fun else findLeftIdentity fun
-      = Just $ mkConstant tp v
-      | otherwise
-      = Nothing
+scanCode :: FoldScanCodeGen Native CPULoopAnalysis
+scanCode = FoldScanCodeGen (Just parCodeGenFoldCommutative) parCodeGenChainedScan
 
 parCodeGenFoldCommutative
-  :: Bool
-  -> Fun env (e -> e -> e)
-  -> Exp env e
-  -> Exp env e
-  -> Arg env (In (sh, Int) e)
-  -> Arg env (Out sh e)
-  -> ExpVars idxEnv (sh, Int)
-  -> ExpVars idxEnv sh
-  -> Exists (NParLoopCodeGen env idxEnv)
-parCodeGenFoldCommutative _ fun seed identity input output inputIdx outputIdx = Exists $ ParLoopCodeGen
+  :: ParCodeGenFoldCommutative Native CPULoopAnalysis env idxEnv sh e
+parCodeGenFoldCommutative _ tp fun seed identity input output = Exists $ ParLoopCodeGen
   (CPULoopAnalysis False)
-  -- In kernel memory, store a lock (Word8) and the
-  -- reduced value so far. The lock must be acquired to read or update the total value.
-  -- Value 0 means unlocked, 1 is locked.
-  (bufferEltsR memoryTp)
+  (bufferEltsR $ foldCommKernelMemory tp)
   -- Initialize kernel memory
-  (\ptr envs -> do
-    ptrs <- tuplePtrs memoryTp ptr
-    case ptrs of
-      TupRsingle _ -> internalError "Pair impossible"
-      TupRpair (TupRsingle intPtr) valuePtrs -> do
-        _ <- instr' $ Store NonVolatile intPtr (scalar scalarTypeWord8 0) Nothing -- unlocked
-        value <- llvmOfExp (compileArrayInstrEnvs envs) seed
-        tupleStore tp valuePtrs value
-  )
+  (\ptr envs -> foldCommInit envs tp ptr seed)
   -- Initialize a thread
   (\_ envs -> do
     accumVar <- tupleAlloca tp
@@ -488,124 +365,90 @@ parCodeGenFoldCommutative _ fun seed identity input output inputIdx outputIdx = 
   (\_ _ _ _ -> return ())
   -- Code within the tile loop
   (\_ accumVar _ envs -> do
-    x <- readArray' envs input inputIdx
+    x <- input envs
     accum <- tupleLoad tp accumVar
-    new <-
-      if envsDescending envs then
-        app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) x accum
-      else
-        app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) accum x
+    new <- app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) accum x
     tupleStore tp accumVar new
   )
   -- Code after the tile loop
   (\_ _ _ _ -> return ())
   -- Code at the end of a thread
   (\accumVar ptr envs -> do
-    ptrs <- tuplePtrs memoryTp ptr
-    case ptrs of
-      TupRsingle _ -> internalError "Pair impossible"
-      TupRpair (TupRsingle lock) valuePtrs -> do
-        -- TODO: Use atomic compare-and-swap or read-modify-write
-        -- to update the value in kernel memory lock-free,
-        -- instead of taking a lock here.
-        _ <- Loop.while [] TupRunit
-          (\_ -> do
-            -- While the lock is taken
-            old <- instr $ AtomicRMW numType NonVolatile Exchange lock (scalar scalarTypeWord8 1) (CrossThread, Acquire)
-            A.neq singleType old (A.liftWord8 0)
-          )
-          (\_ -> return OP_Unit)
-          OP_Unit
-
-        local <- tupleLoad tp accumVar
-
-        old <- tupleLoad tp valuePtrs
-        new <-
-          if envsDescending envs then
-            app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) local old
-          else
-            app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) old local
-        tupleStore tp valuePtrs new
-
-        -- Release the lock
-        _ <- instr' $ AtomicStore singleType lock (scalar scalarTypeWord8 0) Release
-        return ()
+    local <- tupleLoad tp accumVar
+    foldCommFinishThread envs tp ptr fun local
   )
   -- Code after the loop
   (\ptr envs -> do
-    ptrs <- tuplePtrs memoryTp ptr
-    case ptrs of
-      TupRsingle _ -> internalError "Pair impossible"
-      TupRpair _ valuePtrs -> do
-        value <- tupleLoad tp valuePtrs
-        writeArray' envs output outputIdx value
+    value <- foldCommFinish tp ptr
+    output envs value
   )
   Nothing
-  where
-    memoryTp = TupRsingle scalarTypeWord8 `TupRpair` tp
-    ArgArray _ (ArrayR _ tp) _ _ = input
 
-parCodeGenScan
-  :: Bool -- Whether the loop is descending
-  -- Whether this is a fold. Folds use similar code generation as scans, hence
-  -- it is handled here. Commutative folds are handled separately.
-  -> FoldOrScan
-  -> Fun env (e -> e -> e)
-  -> Maybe (Exp env e) -- Seed
-  -> Arg env (In (sh, Int) e)
-  -> ExpVars idxEnv (sh, Int)
-  -- Code after evaluating the seed
-  -- Must be 'return ()' if the seed is Nothing
-  -> (Envs env idxEnv -> Operands e -> CodeGen Native ())
-  -- Code in a tile loop, before the combination (for exclusive scans)
-  -- Must be 'return ()' if the seed is Nothing
-  -> (Envs env idxEnv -> Operands e -> CodeGen Native ())
-  -- Code in a tile loop, after the combination (for inclusive scans)
-  -> (Envs env idxEnv -> Operands e -> CodeGen Native ())
-  -- Code after the parallel loop
-  -> (Envs env idxEnv -> Operands e -> CodeGen Native ())
-  -> Exists (NParLoopCodeGen env idxEnv)
-parCodeGenScan descending foldOrScan fun Nothing input index codeSeed codePre codePost codeEnd
-  | Just identity <- if descending then findRightIdentity fun else findLeftIdentity fun
-  = parCodeGenScan descending foldOrScan fun (Just $ mkConstant tp identity) input index codeSeed codePre codePost codeEnd
-  where
-    ArgArray _ (ArrayR _ tp) _ _ = input
-parCodeGenScan descending foldOrScan fun seed input index codeSeed codePre codePost codeEnd = Exists $ ParLoopCodeGen
+-- Implements the single-pass chained scan with decoupled-lookback
+-- (https://research.nvidia.com/sites/default/files/publications/nvr-2016-002.pdf)
+-- Compared to the paper, we made two major changes:
+-- 1. The scan is modified to work on CPUs, and features a specialized
+--    single-threaded mode that is active as long as only one thread works on
+--    the scan. It switches to the parallel mode dynamically.
+--    (https://dl.acm.org/doi/pdf/10.1145/3649169.3649248)
+-- 2. The array of descriptors (state per tile) is stored as a circular buffer.
+--    This required additional synchronisations, as detailed below.
+--
+-- We want to make the following further improvements to these scans:
+-- 1. Interleave multiple tiles on a single thread,
+--    to hide the latency of blocking in the look-back.
+--    Note that syncDistance (see below in the code) needs to be updated when
+--    implementing this.
+--    (https://studenttheses.uu.nl/items/3ef19878-f012-49c9-a86d-df79e1bd7c2d)
+-- 2. (Need to re-evaluate if this is beneficial after implementing interleaved
+--    scans): Optimize look-back for segmented scans, by using the boundaries
+--    of segments
+--    (https://studenttheses.uu.nl/server/api/core/bitstreams/c0289d3a-da20-4e79-bc90-f37b462f36cd/content)
+-- 3. SIMD vectorization (general improvement for code generation)
+-- 4. Reduce number of tile loops when scans are horizontally fused.
+--    Fused scans add additional tile loops, but this is only necessary when
+--    they are vertically or diagonally fused.
+parCodeGenChainedScan
+  :: forall env idxEnv sh e. ParCodeGenChainedScan Native CPULoopAnalysis env idxEnv sh e
+parCodeGenChainedScan _descending foldOrScan inclusiveness tp fun seed identity input codeSeed codeElement codeEnd = Exists $ ParLoopCodeGen
   -- If we know an identity value, we can implement this without loop peeling
   (CPULoopAnalysis $ isNothing identity)
   -- In kernel memory, store the index of the block we must now handle and the
   -- reduced value so far. 'Handle' here means that we should now add the value
   -- of that block.
-  (bufferEltsR memoryTp)
+  (TupRsingle memoryTp)
   -- Initialize kernel memory
   (\ptr envs -> do
-    ptrs <- tuplePtrs memoryTp ptr
-    case ptrs of
-      TupRsingle _ -> internalError "Pair impossible"
-      TupRpair (TupRsingle intPtr) valuePtrs -> do
-        _ <- instr' $ Store NonVolatile intPtr (scalar scalarTypeInt 0) Nothing
-        case seed of
-          Nothing -> return ()
-          Just s -> do
-            value <- llvmOfExp (compileArrayInstrEnvs envs) s
-            codeSeed envs value
-            tupleStore tp valuePtrs value
+    valuePtrs <- chainedScanInit descriptorsLength tp ptr
+    case seed of
+      Nothing -> return ()
+      Just s -> do
+        value <- llvmOfExp (compileArrayInstrEnvs envs) s
+        codeSeed envs value
+        tupleStore tp valuePtrs value
   )
   -- Initialize a thread
-  (\_ _ -> tupleAlloca tp)
+  -- State of a thread consists of:
+  -- * Accumulator within reduce or scan loop
+  -- * Index of tile in look-back
+  -- * Value (prefix/aggregate) of look-back
+  (\_ _ -> do
+    accumVar <- tupleAlloca tp
+    lookbackIndex <- hoistAlloca $ ScalarPrimType scalarTypeInt
+    lookbackValue <- tupleAlloca tp
+    return (accumVar, lookbackIndex, lookbackValue)
+  )
   -- Code before the tile loop
-  (\singleThreaded accumVar ptr envs ->
+  (\singleThreaded (accumVar, _, _) ptr envs ->
     if singleThreaded then do
       -- In the single threaded mode, we directly do a scan over this tile,
       -- instead of the reduce, lookback and scan phases.
-      ptrs <- tuplePtrs memoryTp ptr
-      case ptrs of
-        TupRsingle _ -> internalError "Pair impossible"
-        TupRpair _ valuePtrs -> do
-          prefix <- tupleLoad tp valuePtrs
-          tupleStore tp accumVar prefix
-          -- Note: on the first tile, we read an undefined value if there is no
-          -- seed. This is fine, as we don't use this value in the tile loop.
+      (descIdx, _) <- descriptorIdxTag (envsTileIndex envs)
+      (_, _, valuePtrs) <- getDescriptorSlot ptr descIdx
+      prefix <- tupleLoad tp valuePtrs
+      tupleStore tp accumVar prefix
+      -- Note: on the first tile, we read an undefined value if there is no
+      -- seed. This is fine, as we don't use this value in the tile loop.
     else
       case identity of
         Nothing -> return ()
@@ -614,179 +457,79 @@ parCodeGenScan descending foldOrScan fun seed input index codeSeed codePre codeP
           tupleStore tp accumVar value
   )
   -- Code within the tile loop
-  (\singleThreaded accumVar _ envs ->
+  (\singleThreaded (accumVar, _, _) _ envs ->
     if singleThreaded then do
       -- Single threaded mode. We directly perform a scan here.
-      x <- readArray' envs input index
-      if isJust seed then do
-        accum <- tupleLoad tp accumVar
-        codePre envs accum
-        new <- if envsDescending envs then
-          app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) x accum
-        else
-          app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) accum x
-        codePost envs new
-        tupleStore tp accumVar new
-      else do
-        isFirstTile <- A.eq singleType (envsTileIndex envs) (A.liftInt 0)
-        new <- A.ifThenElse (tp, A.land isFirstTile $ envsIsFirst envs)
-          ( do
-            return x
-          )
-          ( do
-            accum <- tupleLoad tp accumVar
-            codePre envs accum
-            if envsDescending envs then
-              app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) x accum
-            else
-              app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) accum x
-          )
-        codePost envs new
-        tupleStore tp accumVar new
+      x <- input envs
+
+      accum <- tupleLoad tp accumVar
+      when (inclusiveness == ScanExclusive) $ codeElement envs accum
+      isFirstTile <- A.eq singleType (envsTileIndex envs) (A.liftInt 0)
+      first <- A.land isFirstTile $ envsIsFirst envs
+      new <- combineInDirection envs tp fun seed first False accum x
+      when (inclusiveness == ScanInclusive) $ codeElement envs new
+      tupleStore tp accumVar new
     else do
       -- Parallel mode.
       -- Execute the reduce-phase of a parallel chained scan here.
-      x <- readArray' envs input index
-      new <-
-        if isJust identity then do
-          accum <- tupleLoad tp accumVar
-          if envsDescending envs then
-            app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) x accum
-          else
-            app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) accum x
-        else
-          A.ifThenElse' (tp, envsIsFirst envs)
-            ( do
-              return x
-            )
-            ( do
-              accum <- tupleLoad tp accumVar
-              if envsDescending envs then
-                app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) x accum
-              else
-                app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) accum x
-            )
+      x <- input envs
+      accum <- tupleLoad tp accumVar
+      new <- combineInDirection envs tp fun identity (envsIsFirst envs) False accum x
       tupleStore tp accumVar new
   )
   -- Code after the tile loop
-  (\singleThreaded accumVar ptr envs -> do
-    ptrs <- tuplePtrs memoryTp ptr
-    case ptrs of
-      TupRsingle _ -> internalError "Pair impossible"
-      TupRpair (TupRsingle idxPtr) valuePtrs -> do
-        if singleThreaded then
-          -- It is our turn since we are in the sequential mode,
-          -- no need to wait
-          return ()
-        else do
-          _ <- Loop.while [] TupRunit
-            (\_ -> do
-              idx <- instr $ AtomicLoad singleType idxPtr Acquire
-              A.neq singleType idx (envsTileIndex envs)
-            )
-            (\_ -> return OP_Unit)
-            OP_Unit
-          return ()
+  (\singleThreaded (accumVar, lookbackIndex, lookbackValue) ptr envs -> do
+    local <- tupleLoad tp accumVar
 
-        local <- tupleLoad tp accumVar
-
-        new <-
-          if singleThreaded then
-            -- In the single threaded mode, 'local' is already the prefix,
-            -- as this loop starts with the prefix value of the previous
-            -- thread. We can directly write that to kernel memory.
-            return local
-          else if isNothing seed then
-            -- If there is no seed, then write the output directly in the first tiles.
-            -- The other tiles must combine their result with the given operator.
-            -- Note that the first tile should typically be handled in the sequential mode,
-            -- but this sequential mode is not always generated:
-            -- A non-commutative fold is handled as a scan without the sequential mode.
-            -- Furthermore we could decide to skip the sequential mode if it leads to
-            -- a lot of code duplication (but we don't do that yet).s
-            A.ifThenElse (tp, A.eq singleType (envsTileIndex envs) (A.liftInt 0))
-              (do
-                return local
-              )
-              (do
-                prefix <- tupleLoad tp valuePtrs
-                tupleStore tp accumVar prefix
-                if envsDescending envs then
-                  app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) local prefix
-                else
-                  app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) prefix local
-              )
-          -- If there is a seed, then all tile will combine their local result with
-          -- the already available value.
-          else do
-            prefix <- tupleLoad tp valuePtrs
-            tupleStore tp accumVar prefix
-            if envsDescending envs then
-              app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) local prefix
-            else
-              app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) prefix local
-        tupleStore tp valuePtrs new
-
-        OP_Int nextIdx <- A.add numType (envsTileIndex envs) (A.liftInt 1)
-        _ <- instr' $ AtomicStore singleType idxPtr nextIdx Release
-        return ()
+    if singleThreaded then do
+      nextTileIdx <- A.add numType (envsTileIndex envs) (A.liftInt 1)
+      (thisDescIdx, thisTag) <- descriptorIdxTag nextTileIdx
+      (thisFlagPtr, _, thisPrefixPtrs) <- getDescriptorSlot ptr thisDescIdx
+      -- In the single threaded mode, 'local' is already the prefix,
+      -- as this loop starts with the prefix value of the previous
+      -- thread. We can directly write that to kernel memory.
+      -- It is our turn since we are in the sequential mode,
+      -- no need to wait.
+      tupleStore tp thisPrefixPtrs local
+      OP_Word8 newFlag <- A.bor TypeWord8 thisTag $ OP_Word8 flagPrefix
+      _ <- instrMD' (AtomicStore scalarType thisFlagPtr newFlag Release) (bufferMetadata' Nothing)
+      return ()
+    else do
+      -- In the parallel mode, 'local' is the aggregate value of this tile.
+      (exclusive, _) <- chainedScanLookback envs getThreadCount descriptorsLength tp ptr lookbackIndex lookbackValue fun seed identity local
+      tupleStore tp accumVar exclusive -- Used in second tile loop (only in parallel mode)
+    return ()
   )
   (\_ _ _ -> return ())
   -- Code after the loop
   (\ptr envs -> do
-    ptrs <- tuplePtrs memoryTp ptr
-    case ptrs of
-      TupRsingle _ -> internalError "Pair impossible"
-      TupRpair _ valuePtrs -> do
-        value <- tupleLoad tp valuePtrs
-        codeEnd envs value
+    value <- chainedScanFinish envs descriptorsLength tp ptr
+    codeEnd envs value
   )
   -- In the next tile loop, we prefer loop peeling iff there is no seed.
   -- In the first iteration, the first tile loop will then start without a prefix value,
   -- and we thus should do loop peeling there.
   -- Not executed when this tile is executed in the sequential mode.
   (if foldOrScan == IsFold then Nothing else
-    Just (CPULoopAnalysis $ isNothing seed, \accumVar _ envs -> do
-      x <- readArray' envs input index
-      if isJust seed then do
-        accum <- tupleLoad tp accumVar
-        codePre envs accum
-        new <- if envsDescending envs then
-          app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) x accum
-        else
-          app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) accum x
-        codePost envs new
-        tupleStore tp accumVar new
-      else do
-        isFirstTile <- A.eq singleType (envsTileIndex envs) (A.liftInt 0)
-        new <- A.ifThenElse (tp, A.land isFirstTile $ envsIsFirst envs)
-          ( do
-            return x
-          )
-          ( do
-            accum <- tupleLoad tp accumVar
-            codePre envs accum
-            if envsDescending envs then
-              app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) x accum
-            else
-              app2 (llvmOfFun2 (compileArrayInstrEnvs envs) fun) accum x
-          )
-        codePost envs new
-        tupleStore tp accumVar new
+    Just (CPULoopAnalysis $ isNothing seed, \(accumVar, _, _) _ envs -> do
+      x <- input envs
+      accum <- tupleLoad tp accumVar
+      when (inclusiveness == ScanExclusive) $ codeElement envs accum
+      isFirstTile <- A.eq singleType (envsTileIndex envs) (A.liftInt 0)
+      first <- A.land isFirstTile $ envsIsFirst envs
+      new <- combineInDirection envs tp fun seed first False accum x
+      when (inclusiveness == ScanInclusive) $ codeElement envs new
+      tupleStore tp accumVar new
     )
   )
   where
-    memoryTp = TupRsingle scalarTypeInt `TupRpair` tp
-    ArgArray _ (ArrayR _ tp) _ _ = input
-    identity
-      | Just s <- seed
-      , if descending then isRightIdentity fun s else isLeftIdentity fun s
-      = Just s
-      | Just v <- if descending then findRightIdentity fun else findLeftIdentity fun
-      = Just $ mkConstant tp v
-      | otherwise
-      = Nothing
+    -- ((flag, valueAggregate), valuePrefix)
+    memoryTp = chainedScanKernelMemory descriptorsLength tp
 
+    descriptorIdxTag = chainedScanDescriptorIdxTag descriptorsLength
+    getDescriptorSlot = chainedScanGetDescriptorSlot descriptorsLength tp
+
+{- TODO WALL: DEAD CODE
 -- Checks if the cluster has a permute.
 hasNPermute :: FlatCluster NativeOp env -> Bool
 hasNPermute (FlatCluster _ _ _ _ _ _ flatOps) = go flatOps
@@ -797,3 +540,15 @@ hasNPermute (FlatCluster _ _ _ _ _ _ flatOps) = go flatOps
     go (FlatOpsOp (FlatOp NPermute _ _) _) = True
     go (FlatOpsOp (FlatOp NPermute' _ _) _) = True
     go (FlatOpsOp _ ops) = go ops
+-}
+
+-- Ideally, this should be at least three times the number of threads.
+-- When this is set lower (or from the other perspective, there are too many
+-- threads), scans will still function correctly, but have more
+-- synchronisations. This will essentially convert the chained scan *with
+-- decoupled look-back* to a regular chained scan.
+--
+-- This should be at least 2 (but preferably a lot larger, as noted above)
+--
+descriptorsLength :: Int
+descriptorsLength = 1024

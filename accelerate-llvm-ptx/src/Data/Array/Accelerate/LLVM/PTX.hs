@@ -1,16 +1,5 @@
-{-# LANGUAGE AllowAmbiguousTypes  #-}
-{-# LANGUAGE BangPatterns         #-}
-{-# LANGUAGE FlexibleInstances    #-}
-{-# LANGUAGE GADTs                #-}
-{-# LANGUAGE OverloadedStrings    #-}
-{-# LANGUAGE RankNTypes           #-}
-{-# LANGUAGE ScopedTypeVariables  #-}
-{-# LANGUAGE TemplateHaskell      #-}
-{-# LANGUAGE TypeApplications     #-}
-{-# LANGUAGE TypeFamilies         #-}
-{-# LANGUAGE TypeOperators        #-}
-{-# LANGUAGE TypeSynonymInstances #-}
-{-# OPTIONS_GHC -fno-warn-orphans #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# OPTIONS_GHC -Wno-orphans #-}
 -- |
 -- Module      : Data.Array.Accelerate.LLVM.PTX
 -- Copyright   : [2014..2020] The Accelerate Team
@@ -142,8 +131,8 @@ import Control.Exception
 import Control.Monad.Trans
 import Data.Maybe
 import Formatting                                                   ( shown )
+import qualified Language.Haskell.TH                                as TH
 import System.IO.Unsafe
-import qualified Data.Array.Accelerate.TH.Compat                    as TH
 
 
 -- Accelerate: LLVM backend for NVIDIA GPUs

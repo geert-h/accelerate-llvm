@@ -1,8 +1,4 @@
-{-# LANGUAGE GADTs               #-}
-{-# LANGUAGE OverloadedStrings   #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TypeApplications    #-}
-{-# LANGUAGE ViewPatterns        #-}
+{-# LANGUAGE ViewPatterns #-}
 {-# OPTIONS_HADDOCK hide #-}
 -- |
 -- Module      : Data.Array.Accelerate.LLVM.CodeGen.Array
@@ -26,13 +22,13 @@ module Data.Array.Accelerate.LLVM.CodeGen.Array (
 
   intOfIndex,
 
-  firstArrayPtr
+  firstArrayPtr,
+  singleArrayPtr
 
 ) where
 
 import Control.Applicative
 import Prelude                                                      hiding ( read )
-import Data.Bits
 import Data.Typeable                                                ( (:~:)(..) )
 
 import LLVM.AST.Type.GetElementPtr
@@ -49,7 +45,6 @@ import Data.Array.Accelerate.AST.LeftHandSide
 import Data.Array.Accelerate.Representation.Array
 import Data.Array.Accelerate.Representation.Type
 import Data.Array.Accelerate.Representation.Shape
-import Data.Array.Accelerate.Representation.Elt
 import Data.Array.Accelerate.Error
 
 import Data.Array.Accelerate.LLVM.CodeGen.Environment
@@ -64,7 +59,7 @@ import qualified Data.Array.Accelerate.LLVM.CodeGen.Constant        as A
 --
 {-# INLINEABLE readArray' #-}
 readArray'
-    :: forall int genv idxEnv m sh e arch.
+    :: forall genv idxEnv m sh e arch.
        Envs genv idxEnv
     -> Arg genv (m sh e) -- m is In or Mut
     -> ExpVars idxEnv sh
@@ -113,13 +108,13 @@ readBuffer
     -> Operand int
     -> Maybe (Operand Int) -- Index within a tile, if in a tile loop
     -> CodeGen arch (Operand e)
-readBuffer e i (IRBuffer buffer _ v IRBufferScopeArray alias) ix _ = do
+readBuffer e _i (IRBuffer buffer _ v IRBufferScopeArray alias) ix _ = do
   p <- instr' $ GetElementPtr $ GEP1 buffer ix
   load v e p alias
-readBuffer e i (IRBuffer buffer _ v IRBufferScopeSingle alias) _ _ = do
+readBuffer e _i (IRBuffer buffer _ v IRBufferScopeSingle alias) _ _ = do
   p <- instr' $ GetElementPtr $ GEP1 buffer (scalar scalarTypeInt 0)
   load v e p alias
-readBuffer e i (IRBuffer buffer _ v IRBufferScopeTile alias) _ (Just localIx) = do
+readBuffer e _i (IRBuffer buffer _ v IRBufferScopeTile alias) _ (Just localIx) = do
   p <- instr' $ GetElementPtr $ GEP1 buffer localIx
   load v e p alias
 readBuffer _ _ _ _ _ = internalError "Cannot read from buffer in Tile scope"
@@ -128,7 +123,7 @@ readBuffer _ _ _ _ _ = internalError "Cannot read from buffer in Tile scope"
 --
 {-# INLINEABLE writeArray' #-}
 writeArray'
-    :: forall int genv idxEnv m sh e arch.
+    :: forall genv idxEnv m sh e arch.
        Envs genv idxEnv
     -> Arg genv (m sh e) -- m is Out or Mut
     -> ExpVars idxEnv sh
@@ -155,7 +150,7 @@ writeArray' env (ArgArray _ (ArrayR shr tp) sh buffers) idx val = do
 --
 {-# INLINEABLE writeArrayAt' #-}
 writeArrayAt'
-    :: forall int genv idxEnv m sh e arch.
+    :: forall genv idxEnv m sh e arch.
        Envs genv idxEnv
     -> Arg genv (m (sh, Int) e) -- m is Out or Mut
     -> ExpVars idxEnv sh
@@ -212,15 +207,15 @@ writeBuffer
     -> Maybe (Operand Int) -- The local index within a tile, if in a tile loop
     -> Operand e
     -> CodeGen arch ()
-writeBuffer e i (IRBuffer buffer _ v IRBufferScopeArray alias) ix _ x = do
+writeBuffer e _i (IRBuffer buffer _ v IRBufferScopeArray alias) ix _ x = do
   p <- instr' $ GetElementPtr $ GEP1 buffer ix
   _ <- store v e p x alias
   return ()
-writeBuffer e i (IRBuffer buffer _ v IRBufferScopeSingle alias) ix _ x = do
+writeBuffer e _i (IRBuffer buffer _ v IRBufferScopeSingle alias) _ix _ x = do
   p <- instr' $ GetElementPtr $ GEP1 buffer (scalar scalarTypeInt 0)
   _ <- store v e p x alias
   return ()
-writeBuffer e i (IRBuffer buffer _ v IRBufferScopeTile alias) _ (Just localIx) x = do
+writeBuffer e _i (IRBuffer buffer _ v IRBufferScopeTile alias) _ (Just localIx) x = do
   p <- instr' $ GetElementPtr $ GEP1 buffer localIx
   _ <- store v e p x alias
   return ()
@@ -330,3 +325,26 @@ firstArrayPtr envs (ArgArray _ _ _ vars) = case flattenTupR vars of
     Just (GroundOperandBuffer (IRBuffer ptr _ _ _ _)) ->
       instr $ PtrToInt TypeInt ptr
     _ -> internalError "Buffer not found in firstArrayPtr"
+
+-- | Get a pointer to an element of an array at a certain index.
+-- This requires the array to contain single values, not tuples.
+-- This function assumes that the array is stored in global memory,
+-- e.g. has scope IRBufferScopeArray
+--
+singleArrayPtr
+    :: forall int genv idxEnv m sh e arch.
+       IntegralType int
+    -> ScalarType e
+    -> Envs genv idxEnv
+    -> Arg genv (m sh e)
+    -> Operands int
+    -> CodeGen arch (Operand (Ptr (BufferEltR e)), Maybe (MetadataNodeID, MetadataNodeID))
+singleArrayPtr int tp envs (ArgArray _ _ _ (TupRsingle irBuffer)) (op int -> ix)
+  | Refl <- reprIsSingle @ScalarType @e @Buffer tp
+  , IRBuffer buffer _ _ scope alias <- envsPrjBuffer irBuffer envs
+  = case scope of
+      IRBufferScopeArray -> do
+        p <- instr' $ GetElementPtr $ GEP1 buffer ix
+        return (p, alias)
+      _ -> internalError "Expected IRBufferScopeArray"
+singleArrayPtr _ _ _ _ _ = internalError "Tuple impossible"

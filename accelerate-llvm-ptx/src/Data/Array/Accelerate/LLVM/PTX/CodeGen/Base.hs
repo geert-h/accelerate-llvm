@@ -1,14 +1,5 @@
-{-# LANGUAGE DataKinds           #-}
-{-# LANGUAGE GADTs               #-}
-{-# LANGUAGE MultiWayIf          #-}
-{-# LANGUAGE OverloadedStrings   #-}
-{-# LANGUAGE RankNTypes          #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TypeApplications    #-}
-{-# LANGUAGE TypeFamilies        #-}
-{-# LANGUAGE TypeOperators       #-}
-{-# LANGUAGE ViewPatterns        #-}
-{-# OPTIONS_GHC -Wno-orphans     #-}
+{-# LANGUAGE MultiWayIf #-}
+{-# OPTIONS_GHC -Wno-orphans #-}
 -- |
 -- Module      : Data.Array.Accelerate.LLVM.PTX.CodeGen.Base
 -- Copyright   : [2014..2020] The Accelerate Team
@@ -47,7 +38,8 @@ module Data.Array.Accelerate.LLVM.PTX.CodeGen.Base (
   __shfl_up, __shfl_down, __shfl_idx, __broadcast,
 
   -- Shared memory
-  staticSharedMem, staticSharedMemTuple,
+  staticSharedMem, staticSharedMemSingle,
+  staticSharedMemTuple, staticSharedMemTupleSingle,
   sharedMemorySizeAdd,
   dynamicSharedMem,
   sharedMemAddrSpace, sharedMemVolatility,
@@ -64,20 +56,18 @@ import Data.Array.Accelerate.Analysis.Match
 import Data.Array.Accelerate.LLVM.CodeGen.Arithmetic                as A
 import Data.Array.Accelerate.LLVM.CodeGen.Base
 import Data.Array.Accelerate.LLVM.CodeGen.Environment
-import Data.Array.Accelerate.LLVM.CodeGen.Intrinsic
 import Data.Array.Accelerate.LLVM.CodeGen.IR
 import Data.Array.Accelerate.LLVM.CodeGen.Monad
 import Data.Array.Accelerate.LLVM.CodeGen.Sugar
 import Data.Array.Accelerate.LLVM.PTX.Analysis.Launch
 import Data.Array.Accelerate.LLVM.PTX.Target
-import Data.Array.Accelerate.LLVM.PTX.CodeGen.Intrinsic
+import Data.Array.Accelerate.LLVM.PTX.CodeGen.Intrinsic             ()
 import Data.Array.Accelerate.LLVM.State
 import Data.Array.Accelerate.Representation.Elt
 import Data.Array.Accelerate.Representation.Type
 import qualified Data.Array.Accelerate.LLVM.CodeGen.Constant        as A
 import Data.Array.Accelerate.Backend (KernelMetadata)
 
-import Foreign.CUDA.Analysis                                        ( Compute(..), computeCapability )
 import qualified Foreign.CUDA.Analysis                              as CUDA
 
 import LLVM.AST.Type.Constant
@@ -85,7 +75,6 @@ import LLVM.AST.Type.Downcast
 import LLVM.AST.Type.Function
 import LLVM.AST.Type.GetElementPtr
 import LLVM.AST.Type.Global
-import LLVM.AST.Type.InlineAssembly
 import LLVM.AST.Type.Instruction
 import LLVM.AST.Type.Instruction.Atomic
 import qualified LLVM.AST.Type.Instruction.RMW                      as RMW
@@ -155,8 +144,8 @@ perWarp' tp action = do
 -- Executes code in only one warp per threadblock
 warpPerThreadBlock :: CodeGen PTX () -> CodeGen PTX ()
 warpPerThreadBlock action = do
-  id <- warpId
-  when (A.eq singleType id (liftInt32 0)) action
+  id' <- warpId
+  when (A.eq singleType id' (liftInt32 0)) action
 
 -- Executes code only once per thread block (instead of once per thread)
 perThreadBlock :: CodeGen PTX () -> CodeGen PTX ()
@@ -543,7 +532,7 @@ shfl_op
     -> CodeGen PTX (Operands a)     -- value received
 shfl_op sop t mask delta val
   | Refl <- result t = do
-  dev <- liftCodeGen $ asks ptxDeviceProperties
+  _dev <- liftCodeGen $ asks ptxDeviceProperties
 
   let
       -- The CUDA __shfl* instruction take an optional final parameter
@@ -649,7 +638,7 @@ staticSharedMem tp n = do
         , LP.gaConstant = False }
     , LP.globalType = downcast arrayTp
     , LP.globalValue = Just LP.ValUndef
-    , LP.globalAlign = Just (4 `P.max` P.fromIntegral (P.snd $ primSizeAlignment tp'))
+    , LP.globalAlign = Just (4 `P.max` P.snd (primSizeAlignment tp'))
     , LP.globalMetadata = mempty
     }
 
@@ -661,6 +650,11 @@ staticSharedMem tp n = do
   --     $ GEPArray (A.num numType 0 :: Operand Int32) GEPEmpty
 
   return sm
+
+staticSharedMemSingle
+    :: ScalarType e
+    -> CodeGen PTX (Operand (Ptr (BufferEltR e)))
+staticSharedMemSingle tp = ptrCastUnSizedArray <$> staticSharedMem tp 1
 
 staticSharedMemTuple
   :: forall e.
@@ -675,6 +669,18 @@ staticSharedMemTuple tp n = case tp of
     , Refl <- reprIsSingle @PrimType @(BufferEltR e) @Ptr t'
     , Refl <- reprIsSingle @PrimType @(BufferEltR e) @SizedArray t' ->
       TupRsingle <$> staticSharedMem t n
+
+staticSharedMemTupleSingle
+  :: forall e.
+     TypeR e
+  -> CodeGen PTX (TupR Operand (Distribute Ptr (BufferEltR e)))
+staticSharedMemTupleSingle tp = case tp of
+  TupRunit -> return TupRunit
+  TupRpair t1 t2 -> TupRpair <$> staticSharedMemTupleSingle t1 <*> staticSharedMemTupleSingle t2
+  TupRsingle t
+    | t' <- bufferEltR t
+    , Refl <- reprIsSingle @PrimType @(BufferEltR e) @Ptr t' ->
+      TupRsingle <$> staticSharedMemSingle t
 
 -- External declaration in shared memory address space. This must be declared in
 -- order to access memory allocated dynamically by the CUDA driver. This results
@@ -833,4 +839,10 @@ codeGenKernel name args body =
     declare :: GlobalFunction f
     declare = args $ Body VoidType (Just Tail) (fromString name)
 
-type KernelType env = Ptr (SizedArray Word) -> MarshalFun env
+type KernelType env
+  -- Kernel memory
+  = Ptr (SizedArray Word)
+  -- Array of locks
+  -> Ptr Word8
+  -- Arguments for all variables from the environment
+  -> MarshalFun env

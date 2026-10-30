@@ -1,9 +1,4 @@
-{-# LANGUAGE GADTs             #-}
-{-# LANGUAGE BangPatterns      #-}
-{-# LANGUAGE LambdaCase        #-}
-{-# LANGUAGE TypeFamilies      #-}
-{-# LANGUAGE TypeOperators     #-}
-{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TypeFamilies #-}
 
 -- |
 -- Module      : Data.Array.Accelerate.LLVM.PTX.Kernel
@@ -24,24 +19,17 @@ module Data.Array.Accelerate.LLVM.PTX.Kernel (
 
 -- accelerate
 
-import Data.Array.Accelerate.Array.Buffer
-import Data.Array.Accelerate.Representation.Array
-import Data.Array.Accelerate.Representation.Shape
-import Data.Array.Accelerate.Type
 import Data.Array.Accelerate.AST.Idx
 import Data.Array.Accelerate.AST.Exp
-import Data.Array.Accelerate.AST.Var
 import Data.Array.Accelerate.AST.Kernel
 import Data.Array.Accelerate.AST.Schedule
 import Data.Array.Accelerate.AST.Schedule.Uniform
 import Data.Array.Accelerate.Backend
-import Data.Array.Accelerate.Error
 import Data.Array.Accelerate.Lifetime
 import Data.Array.Accelerate.Pretty.Schedule
 
 import Data.Array.Accelerate.LLVM.State
 import Data.Array.Accelerate.LLVM.CodeGen.Environment
-import Data.Array.Accelerate.LLVM.CodeGen.Base
 import Data.Array.Accelerate.LLVM.PTX.Operation
 import Data.Array.Accelerate.LLVM.PTX.Compile.Cache
 import Data.Array.Accelerate.LLVM.PTX.CodeGen
@@ -52,26 +40,23 @@ import Data.Array.Accelerate.LLVM.PTX.Target
 import Data.Array.Accelerate.LLVM.PTX.Link
 import Data.Array.Accelerate.LLVM.PTX.Analysis.Launch
 import Crypto.Hash.XKCP
-import LLVM.AST.Type.Function
 import Data.ByteString.Short                                        ( ShortByteString, fromShort )
 import qualified Data.ByteString.Char8 as Char8
-import System.FilePath                                              ( FilePath, (<.>) )
 import System.IO.Unsafe
 import Control.DeepSeq
 import Control.Monad.Reader
-import Data.Typeable
-import Foreign.Ptr
 import Prettyprinter
 import Data.String
-import LLVM.AST.Type.Downcast
-import LLVM.AST.Type.Representation
 import LLVM.AST.Type.Module
 
 data PTXKernel env where
   PTXKernel
     :: { kernelInit       :: !(Maybe (PTXKernelPhase env))
        , kernelMain       :: !(PTXKernelPhase env)
-       , kernelFinish     :: !(Maybe (PTXKernelPhase env))
+       -- | Whether this kernel may be skipped if the input is empty.
+       -- For fold, fold1, scan{l,r} and scan{l,r}', we must still execute the kernel
+       -- as they do generate output for empty inputs.
+       , kernelSkipEmpty  :: Bool
        , kernelUID        :: {-# UNPACK #-} !UID
        -- Note: [PTX Kernel Grid Size]
        -- We always assign a one-dimensional grid size, for simplicity.
@@ -112,8 +97,8 @@ data PTXKernelPhase env where
     -> PTXKernelPhase env
 
 instance NFData' PTXKernel where
-  rnf' (PTXKernel p1 p2 p3 !_ sz !_ !_ s l) =
-    maybe () rnf' p1 `seq` rnf' p2 `seq` maybe () rnf' p3
+  rnf' (PTXKernel p1 p2 !_ !_ sz !_ !_ s l) =
+    maybe () rnf' p1 `seq` rnf' p2
       `seq` rnf sz `seq` rnf s `seq` rnf l
 
 instance NFData' PTXKernelPhase where
@@ -135,12 +120,11 @@ instance IsKernel PTXKernel where
 
     phaseInit   <- compilePhase uid 1 `mapM` ptxCodeInit   ptxCode
     phaseWork   <- compilePhase uid 0  $     ptxCodeWork   ptxCode
-    phaseFinish <- compilePhase uid 2 `mapM` ptxCodeFinish ptxCode
     
     return $ PTXKernel
       phaseInit
       phaseWork
-      phaseFinish
+      (ptxCodeSkipEmpty ptxCode)
       uid
       (ptxCodeElements ptxCode)
       (ptxCodeElementsPerThread ptxCode)

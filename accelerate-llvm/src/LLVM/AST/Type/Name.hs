@@ -1,8 +1,4 @@
-{-# LANGUAGE DeriveDataTypeable    #-}
-{-# LANGUAGE FlexibleInstances     #-}
-{-# LANGUAGE MultiParamTypeClasses #-}
-{-# LANGUAGE RoleAnnotations       #-}
-{-# LANGUAGE TypeSynonymInstances  #-}
+{-# LANGUAGE CPP #-}
 {-# OPTIONS_HADDOCK hide #-}
 -- |
 -- Module      : LLVM.AST.Type.Name
@@ -58,7 +54,11 @@ type role Name representational
 data Name a
   = Name   {-# UNPACK #-} !ShortByteString    -- ^ a string name
   | UnName {-# UNPACK #-} !Word               -- ^ a number for a nameless thing
-  deriving (Eq, Ord, Read, Show, Typeable, Data)
+  deriving (Eq, Ord, Read, Show, Data)
+
+#if __GLASGOW_HASKELL__ < 912
+deriving instance Typeable Name
+#endif
 
 instance IsString (Name a) where
   fromString = Name . fromString
@@ -78,7 +78,11 @@ castName (UnName n) = UnName n
 --
 
 data Label = Label {-# UNPACK #-} !ShortByteString
-  deriving (Eq, Ord, Read, Show, Typeable, Data)
+  deriving (Eq, Ord, Read, Show, Data)
+
+#if __GLASGOW_HASKELL__ < 912
+deriving instance Typeable Label
+#endif
 
 instance IsString Label where
   fromString = Label . fromString

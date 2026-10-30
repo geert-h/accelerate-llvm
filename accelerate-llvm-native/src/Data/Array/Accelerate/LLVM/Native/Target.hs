@@ -1,5 +1,3 @@
-{-# LANGUAGE TypeApplications #-}
-{-# LANGUAGE OverloadedStrings #-}
 -- |
 -- Module      : Data.Array.Accelerate.LLVM.Native.Target
 -- Copyright   : [2014..2020] The Accelerate Team
@@ -29,14 +27,10 @@ import Data.Array.Accelerate.LLVM.CodeGen.Arithmetic
 import Data.Array.Accelerate.LLVM.CodeGen.Base
 import Data.Array.Accelerate.LLVM.CodeGen.Profile
 
-import Data.Array.Accelerate.LLVM.CodeGen.Arithmetic (liftInt)
 -- standard library
-import Data.ByteString                                              ( ByteString )
-import Data.ByteString.Short                                        ( ShortByteString )
 import qualified System.Info                                        as Info
-import System.IO.Unsafe
 import Data.Array.Accelerate.LLVM.Target.ClangInfo
-import Data.Text                                                    ( Text, unpack )
+import Data.Text                                                    ( unpack )
 import Data.Array.Accelerate.LLVM.CodeGen.Monad                     ( CodeGen )
 import Control.Monad                                                ( void )
 
@@ -69,11 +63,19 @@ instance Intrinsic Native where
       then abort
       else trap
 
+  -- All modern processors should support 64-bit CAS.
+  -- x86-64 (via CMPXCHG16B, except for the first few generation(s)?) and
+  -- modern ARM also support 128-bit CAS, but Accelerate has no 128-bit integer
+  -- type (and this is required during code generation).
+  -- TODO: We should at some point add 128-bit integers, and this would also
+  -- enable CAS on vectors of 128 bits (eg Vec 2 Double, used for complex numbers).
+  supportsAtomicCAS size = return $ size <= 64
+
 printf :: IsPrim a => String -> Operand a -> CodeGen Native ()
 printf format val = do
   (nm, l) <- global_string format
   let strPtr = ConstantOperand $ derefGlobalString l nm
-  call (lamUnnamed primType $ VarLams $ Body (PrimType $ primType @Int32) Nothing (Label "printf"))
+  _ <- call (lamUnnamed primType $ VarLams $ Body (PrimType $ primType @Int32) Nothing (Label "printf"))
        (ArgumentsCons strPtr []
          $ ArgumentsCons val []
            ArgumentsNil)
